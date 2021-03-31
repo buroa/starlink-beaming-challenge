@@ -10,16 +10,23 @@ class Satellite:
             'C': [],
             'D': []
         }
-        self.users = []
 
     def assign(self, user, interferers):
-        assignable = len(self.users) < 32
+        assignable = self.users() < 32
 
         if not assignable:
             return
             
         point_a = C(user.position.x, user.position.y, user.position.z)
         point_b = C(self.position.x, self.position.y, self.position.z)
+
+        degrees = user.degrees_from(self)
+        if degrees <= 135:
+            user.reason('We are outside of {satellite} field of view by {degrees} degrees.'.format(
+                satellite = self,
+                degrees = degrees - 90
+            ))
+            return
 
         # check inferferers
         for interferer in interferers:
@@ -63,25 +70,23 @@ class Satellite:
 
         # assign the user, actually
         self.beams.get(assigned_beam).append(user)
-        self.users.append(user)
 
-        return('sat {sat} beam {beam} user {user} color {color}'.format(
+        # build the response
+        response = 'sat {sat} beam {beam} user {user} color {color}'.format(
             sat = self.id,
-            beam = len(self.users),
+            beam = self.users(),
             user = user.id,
             color = assigned_beam
-        ))
+        )
 
-    def within_view(self, users):
-        response = []
-        for i, user in enumerate(users):
-            distance = user.position.distance(self.position)
-            if distance.x >= 1000 or distance.y >= 1000 or distance.z >= 1000: 
-                continue
-            degrees = user.degrees_from(self)
-            if degrees > 135:
-                response.append((user, degrees, distance))
-        return response
+        # add the response
+        user.response(response)
+
+        # return the response
+        return response, assigned_beam
+
+    def users(self):
+        return sum(map(len, self.beams.values()))
 
     def __repr__(self):
         return 'Satellite({id}, {pos})'.format(

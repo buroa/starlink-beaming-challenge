@@ -6,27 +6,20 @@ class User:
         self.id = id
         self.position = position
         self.reasons = []
+        self.responses = ''
 
     def reason(self, r):
         self.reasons.append(r)
 
-    def degrees_from(self, satellite):
+    def response(self, r):
+        self.responses = r
+
+    def degrees_from(self, other):
         user_np = self.position.to_np()
-        v1 = satellite.position.to_np() - user_np
+        v1 = other.position.to_np() - user_np
         v2 = -user_np
         angle = math.acos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
         return angle * 180.0 / math.pi
-
-    def within_view(self, satellites):
-        response = []
-        for i, satellite in enumerate(satellites):
-            distance = satellite.position.distance(self.position)
-            if distance.x >= 1000 or distance.y >= 1000 or distance.z >= 1000: 
-                continue
-            degrees = self.degrees_from(satellite)
-            if degrees > 135:
-                response.append((satellite, degrees, distance))
-        return response
 
     def __eq__(self, other):
         if self.id != other.id:
@@ -34,6 +27,12 @@ class User:
         if self.position != other.position:
             return False
         return True
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __lt__(self, other):
+        return ((self.degrees_from(other)) < (other.degrees_from(self)))
 
     def __repr__(self):
         return 'User({id}, {pos})'.format(

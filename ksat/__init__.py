@@ -4,13 +4,14 @@ from ksat.classes import *
 # eval the case
 def eval(case):
     
+    f = case
     users, satellites, interferers = [], [], []
     with open(case, 'r') as case:
         users, satellites, interferers = parse(case.read())
 
     if (len(users) > 0 and len(satellites) > 0):
         assigner = Assigner(users, satellites, interferers)
-        assigner.process()
+        assigner.process(f)
     else:
         print('You need to provide atleast a user and a satellite.')
 
