@@ -71,11 +71,11 @@ class Assigner:
             y = users[:, 1],
             z = users[:, 2],
             hoverinfo = 'text',
-            text = ['user {}'.format(x.id) for x in self.users],
+            text = ['user {}<br>{}'.format(x.id, '<br>'.join(x.reasons) if not x.responses else x.responses) for x in self.users],
             mode = 'markers',
             marker = dict(
-                symbol = 'cross',
-                size = 2,
+                symbol = ['circle' if x.responses else 'circle-open' for x in self.users],
+                size = 3.2,
                 color = 'green'
             )
         )
@@ -87,10 +87,10 @@ class Assigner:
             y = satellites[:, 1],
             z = satellites[:, 2],
             hoverinfo = 'text',
-            text = ['satellite {}'.format(x.id) for x in self.satellites],
+            text = ['satellite {} assigned {}'.format(x.id, x.users()) for x in self.satellites],
             mode = 'markers',
             marker = dict(
-                symbol = 'diamond',
+                symbol = ['diamond' if x.users() == 32 else 'diamond-open' for x in self.satellites],
                 size = 5,
                 color = 'red'
             )

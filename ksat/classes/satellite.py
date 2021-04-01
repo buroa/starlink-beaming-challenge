@@ -15,6 +15,9 @@ class Satellite:
         assignable = self.users() < 32
 
         if not assignable:
+            user.reason('{satellite} is full.'.format(
+                satellite = self,
+            ))
             return
             
         point_a = C(user.position.x, user.position.y, user.position.z)
