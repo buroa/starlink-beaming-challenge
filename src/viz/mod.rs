@@ -2093,23 +2093,8 @@ fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
 }
 
 // ---- WASM: solve in a Web Worker, off the render thread ---------------------
-
-/// Worker entry: parse + solve `text` and return `(Scenario, Feasibility, Trace)`
-/// postcard-serialized. Runs the serial solver, so it must be called from a Web
-/// Worker (see web/viz-solve-worker.js), not the render thread.
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen]
-pub fn trace_scenario(text: &str, algo: u8) -> Result<Vec<u8>, wasm_bindgen::JsError> {
-    let algo = Algorithm::ALL
-        .get(algo as usize)
-        .copied()
-        .unwrap_or(Algorithm::Optimized);
-    let scn = io::Scenario::parse(text).map_err(|e| wasm_bindgen::JsError::new(&e))?;
-    let feas = feasibility::build(&scn);
-    let trace = trace::run(&scn, &feas, algo);
-    postcard::to_allocvec(&(scn, feas, trace))
-        .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))
-}
+// `trace_scenario` (the Worker entry) lives in `crate::wasm` so the threaded
+// solver build — which has no `viz` feature — can also export it.
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]

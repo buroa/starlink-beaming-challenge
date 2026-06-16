@@ -29,11 +29,12 @@ const solveWorker = new Worker('./viz-solve-worker.js?v=' + v, { type: 'module' 
 let solveSeq = 0;
 const solvePending = new Map();
 solveWorker.onmessage = ({ data }) => {
+  if (data.type === 'ready') { window.__vizSolveMode = data; return; } // {threaded, workers}
   const p = solvePending.get(data.id);
   if (!p) return;
   solvePending.delete(data.id);
   if (data.error) p.reject(new Error(data.error));
-  else p.resolve(data.bytes);
+  else { window.__vizLastSolve = { ms: data.ms, threaded: data.threaded, workers: data.workers }; p.resolve(data.bytes); }
 };
 window.solveText = (text, algo) => new Promise((resolve, reject) => {
   const id = ++solveSeq;

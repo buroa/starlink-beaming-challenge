@@ -70,7 +70,7 @@ impl Algorithm {
 }
 
 /// One satellite→user beam, recorded in the order it was formed.
-#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy)]
 pub struct Event {
     pub user: u32,
@@ -78,7 +78,7 @@ pub struct Event {
     pub color: u8,
 }
 
-#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     NoSatInView,
@@ -106,7 +106,7 @@ impl Reason {
     }
 }
 
-#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct Unassigned {
     pub user: u32,
     pub reason: Reason,
@@ -114,7 +114,7 @@ pub struct Unassigned {
     pub in_view: u32,
 }
 
-#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct Trace {
     pub events: Vec<Event>,
     pub unassigned: Vec<Unassigned>,

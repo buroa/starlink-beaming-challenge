@@ -53,6 +53,25 @@ pub fn solve_scenario(text: &str, intense: bool) -> Result<String, JsError> {
     String::from_utf8(buf).map_err(|e| JsError::new(&e.to_string()))
 }
 
+/// Solve a scenario for the **visualizer** and return `(Scenario, Feasibility,
+/// Trace)` postcard-serialized. `algo` indexes [`crate::trace::Algorithm::ALL`].
+/// In the threaded build this runs the rayon pool (call `initThreadPool` first),
+/// so the viz gets the same parallel solve as the solver harness — it just lives
+/// in a Worker and hands the Trace back instead of the validator-format string.
+#[cfg(feature = "wire")]
+#[wasm_bindgen]
+pub fn trace_scenario(text: &str, algo: u8) -> Result<Vec<u8>, JsError> {
+    use crate::trace::{self, Algorithm};
+    let algo = Algorithm::ALL
+        .get(algo as usize)
+        .copied()
+        .unwrap_or(Algorithm::Optimized);
+    let scn = io::Scenario::parse(text).map_err(|e| JsError::new(&e))?;
+    let feas = feasibility::build(&scn);
+    let trace = trace::run(&scn, &feas, algo);
+    postcard::to_allocvec(&(scn, feas, trace)).map_err(|e| JsError::new(&e.to_string()))
+}
+
 /// Re-export so `wasm-bindgen` emits the `initThreadPool` JS binding. Call it
 /// once, after `init()`, with the desired worker count (typically
 /// `navigator.hardwareConcurrency`). Only present in threaded builds.

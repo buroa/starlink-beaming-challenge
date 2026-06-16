@@ -31,8 +31,10 @@ case "${1:-}" in
     # thread transform expects) plus the __heap_base / TLS globals it injects into.
     # Single line — RUSTFLAGS is whitespace-split, so no backslash continuations.
     THREAD_FLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=2147483648 -C link-arg=--export=__heap_base -C link-arg=--export-if-defined=__wasm_init_tls -C link-arg=--export-if-defined=__tls_size -C link-arg=--export-if-defined=__tls_align -C link-arg=--export-if-defined=__tls_base"
+    # `wire` adds trace_scenario so the viz's solve Worker can use this threaded
+    # module for a parallel solve (the solver harness ignores the extra export).
     PATH="$BIN:$PATH" RUSTFLAGS="$THREAD_FLAGS" \
-      cargo build --release --lib --no-default-features --features parallel \
+      cargo build --release --lib --no-default-features --features parallel,wire \
       --target wasm32-unknown-unknown -Z build-std=std,panic_abort
     ;;
   --viz)

@@ -36,7 +36,11 @@ default = ["parallel", "viz"]
 parallel = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 # The GPU visualizer and its native-only dependencies. On by default; off when
 # building just the headless solver/library (notably for WASM).
-viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu", "dep:ehttp", "dep:serde", "dep:postcard", "dep:js-sys"]
+viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu", "dep:ehttp", "dep:js-sys", "wire"]
+# Serialize the solve output (Scenario + Feasibility + Trace) across the viz's
+# Web Worker boundary. Enabled by `viz`, and added to the threaded solver build
+# so its Worker can produce a Trace the viz render module deserializes.
+wire = ["dep:serde", "dep:postcard"]
 
 [dependencies]
 rayon = { version = "1", optional = true }

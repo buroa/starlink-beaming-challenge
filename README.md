@@ -167,10 +167,15 @@ coverage + timing. [`web/build.sh`](web/build.sh) wraps the cargo build and
 cross-origin-isolation headers the threaded build needs:
 
 ```sh
-./web/build.sh              # serial  — stable, runs on any static host
-./web/build.sh --threaded   # parallel — nightly + build-std; needs COOP/COEP
-python3 web/serve.py        # → http://localhost:8000/web/
+./web/build.sh              # solver, serial  — stable, runs on any static host
+./web/build.sh --threaded   # solver, parallel — nightly + build-std; needs COOP/COEP
+./web/build.sh --viz        # the visualizer (render module → web/viz-pkg)
+python3 web/serve.py        # → http://localhost:8000/web/  (index.html or beamer.html)
 ```
+
+The visualizer page wants **both** `--viz` (the render module) and `--threaded`
+(the parallel solve module its Worker prefers); with only `--viz` it still works,
+solving serially in the Worker.
 
 The serial build is a one-liner on stable; the threaded build is fussier, because
 this toolchain's `wasm-ld` does *not* derive the threading setup from `+atomics`
@@ -234,10 +239,13 @@ otherwise serial is simpler and needs no special headers.
 whole eframe/egui/wgpu app to wasm, and [`web/beamer.html`](web/beamer.html) mounts
 it on a `<canvas>` via eframe's `WebRunner` — the globe, live nebula, the full HUD,
 and any of the 12 scenarios fetched on demand. The solve runs **in a Web Worker**
-([`web/viz-solve-worker.js`](web/viz-solve-worker.js)): the worker runs the serial
-solver and returns `(Scenario, Feasibility, Trace)` postcard-serialized, the render
-thread rebuilds its state and the canvas keeps animating throughout — so even the
-100k case never freezes. It renders through **WebGL2**: eframe 0.29 ships wgpu 22,
+([`web/viz-solve-worker.js`](web/viz-solve-worker.js)) so the canvas keeps animating
+throughout — and it's **parallel**: the worker prefers the threaded solver module
+(`./web/build.sh --threaded`), bringing up the same 16-way `wasm-bindgen-rayon` pool
+the solver harness uses (10k solves in ~0.4 s vs ~2.5 s serial), and falls back to
+the serial module if the threaded build or cross-origin isolation isn't available.
+It returns `(Scenario, Feasibility, Trace)` postcard-serialized; the render thread
+rebuilds its state. So even the 100k case never freezes. It renders through **WebGL2**: eframe 0.29 ships wgpu 22,
 whose WebGPU path requests a device limit (`maxInterStageShaderComponents`) that
 current browsers removed, so the entry forces `Backends::GL` and the build enables
 wgpu's `webgl` feature. The viz `[[bin]]` moved into the library (`src/viz/`) so
