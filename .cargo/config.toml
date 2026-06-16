@@ -1,0 +1,4 @@
+# `cargo xtask <cmd>` → runs the build-tooling crate (see xtask/). Replaces the
+# old web/build.sh + web/dist.sh shell scripts.
+[alias]
+xtask = "run --package xtask --"

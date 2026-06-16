@@ -44,14 +44,10 @@ jobs:
           key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-wasm-
 
-      # Prebuilt CLI matching the wasm-bindgen crate version in Cargo.lock.
-      - name: Install wasm-bindgen-cli
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-bindgen-cli@0.2.125
-
+      # Builds both wasm modules and assembles web/dist. wasm-bindgen runs as a
+      # library inside xtask, so there's no separate CLI to install.
       - name: Build WASM + assemble site
-        run: bash web/dist.sh
+        run: cargo xtask dist
 
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5

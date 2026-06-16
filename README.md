@@ -161,14 +161,16 @@ builds produce **bit-identical** solutions (verified by diffing the CLI output o
 both builds on cases 09 and 11).
 
 A ready-to-run harness lives in [`web/`](web/): the **visualizer** at `/` and a
-one-button **solver** at `/solver`. [`web/build.sh`](web/build.sh) wraps each
-cargo build and `wasm-bindgen --target web`; [`web/dist.sh`](web/dist.sh) builds
-both WASM modules and assembles the deployable site into `web/dist/`:
+one-button **solver** at `/solver`. An [`xtask`](xtask/) — the Rust replacement
+for build scripts — builds both WASM modules and assembles the deployable site;
+wasm-bindgen runs as a library inside it, so there's nothing external to install:
 
 ```sh
-./web/dist.sh                              # build both modules → web/dist/
+cargo xtask dist                           # build both modules → web/dist/
 (cd web/dist && python3 -m http.server)    # → http://localhost:8000/  (and /solver)
 ```
+
+(`cargo xtask viz` and `cargo xtask solver` build the individual modules.)
 
 The threaded builds need [cross-origin isolation](https://web.dev/articles/coop-coep)
 (for `SharedArrayBuffer`), which static hosts like GitHub Pages can't grant via
@@ -223,7 +225,7 @@ main thread *deadlocks*. The harness runs it in
 [`web/solver-worker.js`](web/solver-worker.js), which also keeps the UI responsive
 during the slower serial solve. (One more static-host wrinkle: wasm-bindgen-rayon's
 worker bootstrap imports the main module as a bare directory, which only resolves
-through a bundler — `build.sh` rewrites it to the explicit file so it works when
+through a bundler — `xtask` rewrites it to the explicit file so it works when
 served as plain files.)
 
 Threading only wins where there's real parallelism to exploit. Measured in-browser
@@ -241,13 +243,13 @@ The 100k case splits into thousands of independent components, so it parallelize
 serial. Reach for the threaded build when the 100k-class solve time matters;
 otherwise serial is simpler and needs no special headers.
 
-**The visualizer runs in the browser too.** `./web/build.sh --viz` compiles the
-whole eframe/egui/wgpu app to wasm, and [`web/beamer.html`](web/beamer.html) mounts
-it on a `<canvas>` via eframe's `WebRunner` — the globe, live nebula, the full HUD,
-and any of the 12 scenarios fetched on demand. The solve runs **in a Web Worker**
-([`web/viz-solve-worker.js`](web/viz-solve-worker.js)) so the canvas keeps animating
+**The visualizer runs in the browser too.** `cargo xtask viz` compiles the whole
+eframe/egui/wgpu app to wasm, and [`web/index.html`](web/index.html) mounts it on a
+`<canvas>` via eframe's `WebRunner` — the globe, live nebula, the full HUD, and any
+of the 12 scenarios fetched on demand. The solve runs **in a Web Worker**
+([`web/viz-solver-worker.js`](web/viz-solver-worker.js)) so the canvas keeps animating
 throughout — and it's **parallel**: the worker prefers the threaded solver module
-(`./web/build.sh --threaded`), bringing up the same 16-way `wasm-bindgen-rayon` pool
+(`cargo xtask solver`), bringing up the same 16-way `wasm-bindgen-rayon` pool
 the solver harness uses (10k solves in ~0.4 s vs ~2.5 s serial), and falls back to
 the serial module if the threaded build or cross-origin isolation isn't available.
 It returns `(Scenario, Feasibility, Trace)` postcard-serialized; the render thread

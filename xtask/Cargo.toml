@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# wasm-bindgen run as a library — no external `wasm-bindgen` CLI to install. Pin
+# to the exact wasm-bindgen version the wasm is compiled against (see Cargo.lock).
+wasm-bindgen-cli-support = "=0.2.125"
+anyhow = "1"

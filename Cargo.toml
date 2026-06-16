@@ -4,6 +4,13 @@ version = "1.0.0"
 edition = "2021"
 description = "Starlink beam planning solver + GPU visualizer."
 
+# `xtask` is the build-tooling crate (cargo xtask dist). It's a separate member
+# so its heavy build deps never compile during a normal `cargo build`; only the
+# root package builds by default.
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+
 [lib]
 name = "beam_planner"
 path = "src/lib.rs"
