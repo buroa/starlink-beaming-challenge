@@ -4,23 +4,23 @@
 #   ./web/build.sh             solver, serial   — stable; runs on any static host
 #   ./web/build.sh --threaded  solver, parallel — rayon on Web Workers (nightly +
 #                                                  build-std; needs cross-origin
-#                                                  isolation, see serve.py)
-#   ./web/build.sh --viz       visualizer       — eframe + wgpu (WebGL2), serial
-#                                                  inline solve; renders the globe
+#                                                  isolation — see coi-serviceworker.js)
+#   ./web/build.sh --viz       visualizer       — eframe + wgpu (WebGL2)
+#
+# To assemble the full deployable site (both modules + the pages), use dist.sh.
 #
 # Resolves the rustup toolchains explicitly so it works even when another cargo
 # (e.g. Homebrew's) shadows rustup on PATH.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-WASM_BINDGEN="${WASM_BINDGEN:-$HOME/.cargo/bin/wasm-bindgen}"
+WASM_BINDGEN="${WASM_BINDGEN:-$(command -v wasm-bindgen || echo "$HOME/.cargo/bin/wasm-bindgen")}"
 WASM="target/wasm32-unknown-unknown/release/beam_planner.wasm"
 
 tc_bin() { dirname "$(rustup which --toolchain "$1" cargo)"; }
 
 THREADED=0
 OUT="web/pkg"
-PAGE="http://localhost:8000/web/"
 case "${1:-}" in
   --threaded)
     THREADED=1
@@ -39,7 +39,6 @@ case "${1:-}" in
     ;;
   --viz)
     OUT="web/viz-pkg"
-    PAGE="http://localhost:8000/web/beamer.html"
     echo ">> visualizer (serial; eframe + wgpu WebGL2)"
     BIN="$(tc_bin stable)"
     PATH="$BIN:$PATH" \
@@ -70,6 +69,4 @@ if [[ "$THREADED" == "1" ]]; then
   echo ">> patched worker import → ../../../beam_planner.js  ($WH)"
 fi
 
-echo ">> done."
-echo "   serve:  python3 web/serve.py"
-echo "   open:   $PAGE"
+echo ">> done → $OUT"

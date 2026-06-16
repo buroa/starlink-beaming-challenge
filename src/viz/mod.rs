@@ -638,7 +638,7 @@ impl App {
             "10_ten_thousand_users_geo_belt", "11_one_hundred_thousand_users",
         ]
         .iter()
-        .map(|n| (n.to_string(), format!("../test_cases/{n}.txt")))
+        .map(|n| (n.to_string(), format!("test_cases/{n}.txt")))
         .collect();
 
         let mut app = App {

@@ -2,205 +2,60 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>beam-planner · wasm</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Beamer · WebAssembly</title>
+<!-- Enables cross-origin isolation (wasm threads) on hosts without COOP/COEP
+     headers, e.g. GitHub Pages. Reloads once on first visit. -->
+<script src="coi-serviceworker.js"></script>
 <style>
-  :root { --fg: #e8eef4; --dim: #7d8893; --line: #2a3138; --accent: #cfe6ff; --bg: #06090d; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    letter-spacing: .02em;
+  html, body { margin: 0; height: 100%; background: #06090d; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #msg {
+    position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    color: #7d8893; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .15em; text-transform: uppercase; text-align: center; padding: 2rem;
   }
-  .wrap { max-width: 920px; margin: 0 auto; padding: 28px 20px 60px; }
-  h1 {
-    font-size: 13px; font-weight: 600; letter-spacing: .35em; margin: 0 0 2px;
-    text-transform: uppercase; color: var(--fg);
-  }
-  .sub { color: var(--dim); margin: 0 0 22px; }
-  .rule { height: 1px; background: var(--line); margin: 16px 0; }
-  .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
-  label { color: var(--dim); text-transform: uppercase; font-size: 11px; letter-spacing: .18em; }
-  select, button, textarea, input[type=file] {
-    background: #0b0f14; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 0; font: inherit; padding: 7px 10px; outline: none;
-  }
-  select:focus, button:focus, textarea:focus { border-color: #4a5663; }
-  button {
-    cursor: pointer; text-transform: uppercase; letter-spacing: .14em;
-    padding: 8px 18px; transition: background .12s, border-color .12s;
-  }
-  button:hover:not(:disabled) { background: #141b22; border-color: #5b6b7a; }
-  button:disabled { opacity: .4; cursor: default; }
-  .chk { display: flex; gap: 7px; align-items: center; color: var(--fg); text-transform: none; letter-spacing: 0; }
-  #status { color: var(--dim); margin: 4px 0 0; min-height: 1.5em; }
-  #status .ok { color: var(--accent); }
-  #status .warn { color: #ffcf6a; }
-  #status .err { color: #ff7b7b; }
-  .stats { display: flex; gap: 28px; flex-wrap: wrap; margin: 18px 0 6px; }
-  .stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .18em; }
-  .stat .v { font-size: 22px; font-weight: 600; }
-  .stat .v small { font-size: 12px; color: var(--dim); font-weight: 400; }
-  textarea { width: 100%; min-height: 84px; margin-top: 10px; resize: vertical; }
-  pre {
-    background: #0a0e12; border: 1px solid var(--line); padding: 12px;
-    max-height: 340px; overflow: auto; white-space: pre; color: #c7d2dc; margin: 12px 0 0;
-  }
-  a { color: var(--accent); }
-  .hint { color: var(--dim); font-size: 11px; }
+  #msg.err { color: #ff7b7b; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Beam-Planner</h1>
-  <p class="sub">Starlink beam allocation, solved in your browser — the production Rust solver compiled to WebAssembly.</p>
-
-  <div class="row">
-    <label for="scenario">Scenario</label>
-    <select id="scenario"></select>
-    <label class="chk"><input type="checkbox" id="intense"> maximum-coverage (slower)</label>
-    <button id="solve" disabled>Solve</button>
-  </div>
-  <div class="row" style="margin-top:12px">
-    <label for="file">or load</label>
-    <input type="file" id="file" accept=".txt">
-    <span class="hint">— or paste a scenario below —</span>
-  </div>
-  <textarea id="paste" placeholder="# satellites / users / interferers in ECEF, validator format…"></textarea>
-
-  <div id="status">initializing…</div>
-  <div class="rule"></div>
-
-  <div class="stats" id="stats" hidden>
-    <div class="stat"><div class="k">Served</div><div class="v" id="s-served">—</div></div>
-    <div class="stat"><div class="k">of optimum</div><div class="v" id="s-opt">—</div></div>
-    <div class="stat"><div class="k">Solve time</div><div class="v" id="s-time">—</div></div>
-    <div class="stat"><div class="k">Mode</div><div class="v" id="s-mode">—</div></div>
-  </div>
-  <div id="dl"></div>
-  <pre id="out" hidden></pre>
-</div>
-
+  <canvas id="beamer"></canvas>
+  <div id="msg">loading beamer…</div>
 <script type="module">
-// The solver runs in a dedicated worker (solver-worker.js): rayon's parallel
-// solve blocks the calling thread, which the browser main thread can't do.
-const worker = new Worker('./solver-worker.js', { type: 'module' });
+const msg = document.getElementById('msg');
+const v = Date.now();
 
-// One-shot request/response over postMessage; rejects on a worker 'error'.
-// Set up the listener BEFORE posting to avoid missing a fast reply.
-function expect(type, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const timer = timeoutMs ? setTimeout(() => { worker.removeEventListener('message', h); reject(new Error(`${type} timed out`)); }, timeoutMs) : 0;
-    function h({ data }) {
-      if (data.type !== type && data.type !== 'error') return;
-      clearTimeout(timer); worker.removeEventListener('message', h);
-      data.type === 'error' ? reject(new Error(data.message)) : resolve(data);
-    }
-    worker.addEventListener('message', h);
-  });
-}
-
-const CASES = [
-  "00_example", "01_simplest_possible", "02_two_users", "03_five_users",
-  "04_one_interferer", "05_equatorial_plane", "06_partially_fullfillable",
-  "07_eighteen_planes", "08_eighteen_planes_northern", "09_ten_thousand_users",
-  "10_ten_thousand_users_geo_belt", "11_one_hundred_thousand_users",
-];
-
-const $ = (id) => document.getElementById(id);
-const statusEl = $("status");
-const setStatus = (html) => { statusEl.innerHTML = html; };
-
-// Populate scenario picker.
-const sel = $("scenario");
-for (const c of CASES) {
-  const o = document.createElement("option");
-  o.value = c; o.textContent = c.replace(/_/g, " ");
-  sel.appendChild(o);
-}
-sel.value = "09_ten_thousand_users";
-
-let threaded = false;
-
-async function boot() {
-  // The worker loads the wasm and, for the threaded build, brings up the rayon
-  // pool. We just wait for it to report ready (guarded by a timeout so a browser
-  // that can't start the pool shows a message instead of hanging forever).
-  const n = navigator.hardwareConcurrency || 4;
-  setStatus(`starting solver…`);
-  const ready = expect("ready", 30000);
-  worker.postMessage({ type: "init", threads: n });
-  let r;
-  try {
-    r = await ready;
-  } catch (e) {
-    setStatus(`<span class="err">${e.message}.</span> If this is the threaded build, serve via ` +
-              `<code>python3 web/serve.py</code> (COOP/COEP) on a desktop browser, or rebuild serial: <code>./web/build.sh</code>.`);
-    return;
-  }
-  threaded = r.threaded;
-  setStatus(r.threaded
-    ? `<span class="ok">ready</span> · threaded · ${r.threads} workers · crossOriginIsolated`
-    : `<span class="ok">ready</span> · serial build`);
-  $("solve").disabled = false;
-}
-
-async function scenarioText() {
-  const pasted = $("paste").value.trim();
-  if (pasted) return pasted;
-  const file = $("file").files[0];
-  if (file) return await file.text();
-  const name = sel.value + ".txt";
-  setStatus(`fetching ${name}…`);
-  const r = await fetch(`../test_cases/${name}`);
-  if (!r.ok) throw new Error(`could not fetch ${name} (${r.status}) — is serve.py running from the repo root?`);
-  return await r.text();
-}
-
-$("solve").addEventListener("click", async () => {
-  const btn = $("solve");
-  btn.disabled = true;
-  $("stats").hidden = true; $("out").hidden = true; $("dl").innerHTML = "";
-  try {
-    const text = await scenarioText();
-    const intense = $("intense").checked;
-    setStatus(`solving${intense ? " (maximum-coverage)" : ""}…`);
-
-    // Hand off to the worker; the UI stays responsive while it runs.
-    const done = expect("result", 0);
-    worker.postMessage({ type: "solve", text, intense });
-    const { solution, ms: dt } = await done;
-
-    // The certificate header carries the headline numbers.
-    const total = (solution.match(/users_total=(\d+)/) || [])[1];
-    const ach = solution.match(/achieved = (\d+) \(([\d.]+)%\)/);
-    const opt = solution.match(/achieved\/bound = ([\d.]+%)/);
-
-    $("s-served").innerHTML = ach ? `${(+ach[1]).toLocaleString()} <small>/ ${(+total).toLocaleString()} · ${ach[2]}%</small>` : "—";
-    $("s-opt").textContent = opt ? opt[1] : "—";
-    $("s-time").innerHTML = `${dt < 1000 ? dt.toFixed(0) + " <small>ms</small>" : (dt / 1000).toFixed(2) + " <small>s</small>"}`;
-    $("s-mode").textContent = (threaded ? "threaded" : "serial") + (intense ? " · max" : "");
-    $("stats").hidden = false;
-
-    const head = solution.split("\n").slice(0, 6).join("\n");
-    const lines = solution.split("\n").length;
-    $("out").textContent = head + `\n…\n(${lines.toLocaleString()} lines total)`;
-    $("out").hidden = false;
-
-    const blob = new Blob([solution], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    $("dl").innerHTML = `<a href="${url}" download="${sel.value}.solution.txt">↓ download full solution</a>`;
-
-    setStatus(`<span class="ok">done</span> in ${dt.toFixed(0)} ms`);
-  } catch (e) {
-    setStatus(`<span class="err">error:</span> ${e.message || e}`);
-    console.error(e);
-  } finally {
-    btn.disabled = false;
-  }
+// The solve runs off the render thread (the 100k solve is ~32s). This worker
+// runs the serial solver and returns the result serialized; window.solveText is
+// what the viz wasm calls (the `solveText` import). Define it BEFORE start().
+const solveWorker = new Worker('./viz-solver-worker.js?v=' + v, { type: 'module' });
+let solveSeq = 0;
+const solvePending = new Map();
+solveWorker.onmessage = ({ data }) => {
+  if (data.type === 'ready') { window.__vizSolveMode = data; return; } // {threaded, workers}
+  const p = solvePending.get(data.id);
+  if (!p) return;
+  solvePending.delete(data.id);
+  if (data.error) p.reject(new Error(data.error));
+  else { window.__vizLastSolve = { ms: data.ms, threaded: data.threaded, workers: data.workers }; p.resolve(data.bytes); }
+};
+window.solveText = (text, algo) => new Promise((resolve, reject) => {
+  const id = ++solveSeq;
+  solvePending.set(id, { resolve, reject });
+  solveWorker.postMessage({ id, text, algo });
 });
 
-boot().catch((e) => setStatus(`<span class="err">init failed:</span> ${e.message || e}`));
+try {
+  // Cache-bust both the JS glue and the wasm so a rebuild is always picked up.
+  const mod = await import('./viz-pkg/beam_planner.js?v=' + v);
+  await mod.default({ module_or_path: './viz-pkg/beam_planner_bg.wasm?v=' + v });
+  await mod.start(document.getElementById('beamer'));
+  msg.remove(); // eframe owns the canvas now
+} catch (e) {
+  msg.classList.add('err');
+  msg.textContent = 'Beamer failed to start: ' + ((e && e.message) || e);
+  console.error(e);
+}
 </script>
 </body>
 </html>

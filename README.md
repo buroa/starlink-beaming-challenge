@@ -160,18 +160,23 @@ OS-thread pool natively, or rayon-on-Web-Workers in the browser via
 builds produce **bit-identical** solutions (verified by diffing the CLI output of
 both builds on cases 09 and 11).
 
-A ready-to-run harness lives in [`web/`](web/) — a one-button page that loads the
-module, lets you pick a scenario (or paste/drop one), and shows the solved
-coverage + timing. [`web/build.sh`](web/build.sh) wraps the cargo build and
-`wasm-bindgen --target web`; [`web/serve.py`](web/serve.py) serves it with the
-cross-origin-isolation headers the threaded build needs:
+A ready-to-run harness lives in [`web/`](web/): the **visualizer** at `/` and a
+one-button **solver** at `/solver`. [`web/build.sh`](web/build.sh) wraps each
+cargo build and `wasm-bindgen --target web`; [`web/dist.sh`](web/dist.sh) builds
+both WASM modules and assembles the deployable site into `web/dist/`:
 
 ```sh
-./web/build.sh              # solver, serial  — stable, runs on any static host
-./web/build.sh --threaded   # solver, parallel — nightly + build-std; needs COOP/COEP
-./web/build.sh --viz        # the visualizer (render module → web/viz-pkg)
-python3 web/serve.py        # → http://localhost:8000/web/  (index.html or beamer.html)
+./web/dist.sh                              # build both modules → web/dist/
+(cd web/dist && python3 -m http.server)    # → http://localhost:8000/  (and /solver)
 ```
+
+The threaded builds need [cross-origin isolation](https://web.dev/articles/coop-coep)
+(for `SharedArrayBuffer`), which static hosts like GitHub Pages can't grant via
+headers — so [`web/coi-serviceworker.js`](web/coi-serviceworker.js) supplies it
+with a service worker (the harnesses fall back to a serial solve if it's
+unavailable). A GitHub Actions workflow ([`.github/workflows/pages.yml`](.github/workflows/pages.yml))
+builds both modules and publishes the site to **GitHub Pages** on every push to
+`main` — one-time setup: repo *Settings → Pages → Source → "GitHub Actions"*.
 
 The visualizer page wants **both** `--viz` (the render module) and `--threaded`
 (the parallel solve module its Worker prefers); with only `--viz` it still works,
@@ -204,11 +209,12 @@ wasm-bindgen target/wasm32-unknown-unknown/release/beam_planner.wasm --target we
 `std::time::Instant` (used for the solver's repair deadlines) panics on
 `wasm32-unknown-unknown`, so the library uses [`web-time`](https://crates.io/crates/web-time),
 an API-identical drop-in that is a zero-cost std re-export off-wasm. The threaded
-build's `SharedArrayBuffer` requires the page to be **cross-origin isolated** —
-serve it with `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp` (the basemap tile CDNs already send
-`Access-Control-Allow-Origin: *`, so they survive that policy). The serial build
-has no such requirement and is the simplest way to ship.
+build's `SharedArrayBuffer` requires the page to be **cross-origin isolated**
+(`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
+require-corp`). Hosts that can set headers can do so directly; `coi-serviceworker.js`
+injects them otherwise (and re-serves the cross-origin basemap tiles — which send
+`Access-Control-Allow-Origin: *` — as `Cross-Origin-Resource-Policy: cross-origin`
+so they survive the policy). The serial build needs none of this.
 
 **Run the parallel solve in a Worker, not on the main thread.** rayon blocks the
 calling thread until its pool finishes, and the browser main thread is forbidden
