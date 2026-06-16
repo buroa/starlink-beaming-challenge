@@ -31,7 +31,7 @@
 use crate::components::Component;
 use crate::geom::{same_color_conflict, Vec3};
 use crate::io::Scenario;
-use std::time::Instant;
+use web_time::Instant;
 
 /// Components larger than this are left to the matching bound — a min-cost flow
 /// per subgradient iteration is too costly at, e.g., case 11's ~17k-user

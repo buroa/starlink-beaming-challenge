@@ -14,9 +14,9 @@ use crate::components::{self, Component};
 use crate::geom::{same_color_conflict, Vec3};
 use crate::io::Scenario;
 use crate::matching;
+use crate::par::*;
 use arrayvec::ArrayVec;
-use rayon::prelude::*;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Maximum displacement hops in an augmenting search.
 const MAX_DEPTH: u32 = 4;

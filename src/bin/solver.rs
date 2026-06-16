@@ -9,7 +9,7 @@
 
 use beam_planner::{assign, feasibility, io};
 use std::process::exit;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Wall-clock ceiling for the (optional) repair phase — far under the 15-minute
 /// limit; the greedy solution is always complete and valid before repair runs.

@@ -11,7 +11,7 @@ use crate::geom::{visible, Vec3};
 use crate::index::Grid;
 use crate::io::Scenario;
 use crate::{assign, matching};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// A construction the user can watch / compare.
 #[derive(Clone, Copy, PartialEq, Eq)]

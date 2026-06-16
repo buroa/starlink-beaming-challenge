@@ -5,14 +5,12 @@
 //! satellites, control the playback speed, and inspect exactly why any terminal
 //! could not be served.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod camera;
 mod scene;
 mod tiles;
 
-use beam_planner::trace::{self, Algorithm, Reason, Trace};
-use beam_planner::{feasibility, io};
+use crate::trace::{self, Algorithm, Reason, Trace};
+use crate::{feasibility, io};
 use camera::OrbitCamera;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
@@ -2229,7 +2227,9 @@ fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), Str
     Ok(())
 }
 
-fn main() -> eframe::Result<()> {
+/// Native entry point: parse CLI args (`--shot` / `--frames` headless modes) and
+/// otherwise launch the interactive window. Called by the thin `beamer` binary.
+pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s == "--shot").unwrap_or(false) {
         let scenario = args

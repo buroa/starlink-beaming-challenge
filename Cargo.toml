@@ -7,29 +7,58 @@ description = "Starlink beam planning solver + GPU visualizer."
 [lib]
 name = "beam_planner"
 path = "src/lib.rs"
+# rlib for the native bins/tests; cdylib so the wasm32 build emits a `.wasm`
+# module for wasm-bindgen. (The native cdylib artifact is built but unused.)
+crate-type = ["cdylib", "rlib"]
 
 # The solver: scenario in, validator-format solution out.
 [[bin]]
 name = "beam-planner"
 path = "src/bin/solver.rs"
 
-# The interactive GPU visualizer ("Beamer").
+# The interactive GPU visualizer ("Beamer") — a thin shim over the library's
+# `viz` module. Needs the `viz` feature (default); `--no-default-features` builds
+# just the solver + library (e.g. for the WASM solver module, where the viz's
+# native-only deps don't apply).
 [[bin]]
 name = "beamer"
-path = "src/bin/viz/main.rs"
+path = "src/bin/beamer.rs"
+required-features = ["viz"]
+
+[features]
+default = ["parallel", "viz"]
+# Multicore solving. Native: rayon's work-stealing OS-thread pool. Browser/WASM:
+# rayon backed by Web Workers via wasm-bindgen-rayon (needs SharedArrayBuffer +
+# cross-origin isolation — COOP/COEP headers). Disable (`--no-default-features`)
+# for a serial build that compiles on stable for wasm32-unknown-unknown with no
+# thread/atomics requirement; the solver is deterministic, so serial and parallel
+# produce bit-identical solutions.
+parallel = ["dep:rayon", "dep:wasm-bindgen-rayon"]
+# The GPU visualizer and its native-only dependencies. On by default; off when
+# building just the headless solver/library (notably for WASM).
+viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq"]
 
 [dependencies]
-rayon = "1"
+rayon = { version = "1", optional = true }
 arrayvec = "0.7"
+# std::time::Instant panics on wasm32-unknown-unknown; web-time is an API-identical
+# drop-in (a zero-cost std re-export off-wasm, Performance.now()-backed on wasm).
+web-time = "1"
 
-# GPU visualizer (only linked into the beam-viz binary).
-eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"] }
-egui = "0.29"
-bytemuck = { version = "1", features = ["derive"] }
-glam = { version = "0.29", features = ["bytemuck"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-pollster = "0.3"
-ureq = "2"
+# GPU visualizer (only linked into the beamer binary, behind the `viz` feature).
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"], optional = true }
+egui = { version = "0.29", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+glam = { version = "0.29", features = ["bytemuck"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+pollster = { version = "0.3", optional = true }
+ureq = { version = "2", optional = true }
+
+# WASM solver module: the wasm-bindgen entry points, plus the Web Worker thread
+# pool (only when `parallel` is on).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-rayon = { version = "1.2", optional = true }
 
 [profile.dev]
 opt-level = 1

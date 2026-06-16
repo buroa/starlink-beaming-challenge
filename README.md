@@ -139,6 +139,97 @@ of ~400 — is the evidence that that gap is a **global coloring coupling** the
 default solve is already at the practical optimum; `Maximum` just proves it the
 expensive way.
 
+## WebAssembly
+
+The solver core compiles to a browser-ready `wasm-bindgen` module — the same
+production code, exposed as one entry point:
+
+```js
+import init, { solve_scenario, initThreadPool } from './pkg/beam_planner.js';
+await init();
+await initThreadPool(navigator.hardwareConcurrency); // threaded build only
+const solution = solve_scenario(scenarioText, /* intense = */ false);
+// For the threaded build, run these inside a Web Worker — see the note below.
+```
+
+Two Cargo features gate this. `viz` (default) pulls in the visualizer's
+native-only stack (eframe/wgpu/ureq/…); `--no-default-features` drops it to the
+headless solver + library. `parallel` (default) is rayon — a work-stealing
+OS-thread pool natively, or rayon-on-Web-Workers in the browser via
+`wasm-bindgen-rayon`. The solver is deterministic, so the serial and parallel
+builds produce **bit-identical** solutions (verified by diffing the CLI output of
+both builds on cases 09 and 11).
+
+A ready-to-run harness lives in [`web/`](web/) — a one-button page that loads the
+module, lets you pick a scenario (or paste/drop one), and shows the solved
+coverage + timing. [`web/build.sh`](web/build.sh) wraps the cargo build and
+`wasm-bindgen --target web`; [`web/serve.py`](web/serve.py) serves it with the
+cross-origin-isolation headers the threaded build needs:
+
+```sh
+./web/build.sh              # serial  — stable, runs on any static host
+./web/build.sh --threaded   # parallel — nightly + build-std; needs COOP/COEP
+python3 web/serve.py        # → http://localhost:8000/web/
+```
+
+The serial build is a one-liner on stable; the threaded build is fussier, because
+this toolchain's `wasm-ld` does *not* derive the threading setup from `+atomics`
+alone. The memory and TLS globals have to be requested explicitly — an
+**imported, shared, bounded** memory (what wasm-bindgen's thread transform
+expects) plus the `__heap_base`/TLS exports it injects into:
+
+```sh
+# Serial:
+cargo build --release --lib --no-default-features --target wasm32-unknown-unknown
+wasm-bindgen target/wasm32-unknown-unknown/release/beam_planner.wasm --target web --out-dir web/pkg
+
+# Threaded:
+RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+  -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=2147483648 \
+  -C link-arg=--export=__heap_base \
+  -C link-arg=--export-if-defined=__wasm_init_tls \
+  -C link-arg=--export-if-defined=__tls_size \
+  -C link-arg=--export-if-defined=__tls_align \
+  -C link-arg=--export-if-defined=__tls_base' \
+  cargo +nightly build --release --lib --no-default-features --features parallel \
+  --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+wasm-bindgen target/wasm32-unknown-unknown/release/beam_planner.wasm --target web --out-dir web/pkg
+```
+
+`std::time::Instant` (used for the solver's repair deadlines) panics on
+`wasm32-unknown-unknown`, so the library uses [`web-time`](https://crates.io/crates/web-time),
+an API-identical drop-in that is a zero-cost std re-export off-wasm. The threaded
+build's `SharedArrayBuffer` requires the page to be **cross-origin isolated** —
+serve it with `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` (the basemap tile CDNs already send
+`Access-Control-Allow-Origin: *`, so they survive that policy). The serial build
+has no such requirement and is the simplest way to ship.
+
+**Run the parallel solve in a Worker, not on the main thread.** rayon blocks the
+calling thread until its pool finishes, and the browser main thread is forbidden
+from blocking (`Atomics.wait` throws there) — so a threaded solve invoked on the
+main thread *deadlocks*. The harness runs it in
+[`web/solver-worker.js`](web/solver-worker.js), which also keeps the UI responsive
+during the slower serial solve. (One more static-host wrinkle: wasm-bindgen-rayon's
+worker bootstrap imports the main module as a bare directory, which only resolves
+through a bundler — `build.sh` rewrites it to the explicit file so it works when
+served as plain files.)
+
+Threading only wins where there's real parallelism to exploit. Measured in-browser
+on 16 hardware threads (`solve_scenario` wall time, all three matching the CLI's
+coverage exactly):
+
+| Case | Serial | Threaded (16 workers) |
+|---|---|---|
+| `03` · 5 users | 4 ms | 15 ms |
+| `09` · 10k users | 2.5 s | 4.3 s |
+| `11` · 100k users | 31.7 s | **12.0 s** |
+
+The 100k case splits into thousands of independent components, so it parallelizes
+~2.6×; the small cases are dominated by per-op atomic overhead and run faster
+serial. Reach for the threaded build when the 100k-class solve time matters;
+otherwise serial is simpler and needs no special headers.
+
 ## Visualizer — Beamer
 
 `beamer` is a GPU-rendered, interactive 3D globe built straight into the app

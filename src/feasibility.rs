@@ -6,7 +6,7 @@
 use crate::geom::{interferes, visible, Vec3};
 use crate::index::Grid;
 use crate::io::Scenario;
-use rayon::prelude::*;
+use crate::par::*;
 
 pub struct Feasibility {
     /// `sats[u]` = sorted satellite indices user `u` may be served by.

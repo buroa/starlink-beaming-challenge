@@ -5,7 +5,7 @@
 //! flowing data packets. Drawn to an offscreen texture the egui layer
 //! composites.
 
-use crate::tiles::{TileGlobe, TileSource};
+use super::tiles::{TileGlobe, TileSource};
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use std::sync::Arc;
