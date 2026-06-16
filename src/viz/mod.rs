@@ -684,7 +684,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         let default_prefix = "11";
         #[cfg(target_arch = "wasm32")]
-        let default_prefix = "07";
+        let default_prefix = "09";
         if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with(default_prefix)) {
             app.current = i;
         }
@@ -731,21 +731,18 @@ impl App {
             });
             self.loading = Some(rx);
         }
-        // WASM: `src` is a URL. Fetch it asynchronously (so the UI stays
-        // responsive while it downloads), then solve. The result is delivered
-        // through the same mpsc channel the native path uses, so update()'s poll
-        // is unchanged. The solve itself still runs on the render thread here;
-        // the heavy cases move to a Web Worker in the next step.
+        // WASM: `src` is a URL. Fetch it, then solve in a Web Worker (the solve
+        // would otherwise block the render thread — ~32 s on the 100k case). The
+        // worker returns the result serialized; we rebuild `Loaded` and deliver
+        // it through the same mpsc channel the native path uses, so update()'s
+        // poll is unchanged and the "Solving…" overlay shows throughout.
         #[cfg(target_arch = "wasm32")]
         {
             let (tx, rx) = std::sync::mpsc::channel();
             self.loading = Some(rx);
+            let algo_idx = Algorithm::ALL.iter().position(|&a| a == algo).unwrap_or(0) as u8;
             wasm_bindgen_futures::spawn_local(async move {
-                let result = match fetch_scenario(&src).await {
-                    Ok(text) => build_loaded(&text, algo),
-                    Err(e) => Err(e),
-                };
-                let _ = tx.send(result);
+                let _ = tx.send(solve_via_worker(&src, algo_idx).await);
             });
         }
     }
@@ -2087,10 +2084,60 @@ async fn fetch_scenario(url: &str) -> Result<String, String> {
 }
 
 /// Parse + solve scenario text into a [`Loaded`] (platform-independent: no I/O).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // native-only path on wasm
 fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
     let scn = io::Scenario::parse(text).map_err(|e| format!("parse: {e}"))?;
     let feas = feasibility::build(&scn);
     let trace = trace::run(&scn, &feas, algo);
+    Ok(loaded_from_parts(scn, feas, trace))
+}
+
+// ---- WASM: solve in a Web Worker, off the render thread ---------------------
+
+/// Worker entry: parse + solve `text` and return `(Scenario, Feasibility, Trace)`
+/// postcard-serialized. Runs the serial solver, so it must be called from a Web
+/// Worker (see web/viz-solve-worker.js), not the render thread.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn trace_scenario(text: &str, algo: u8) -> Result<Vec<u8>, wasm_bindgen::JsError> {
+    let algo = Algorithm::ALL
+        .get(algo as usize)
+        .copied()
+        .unwrap_or(Algorithm::Optimized);
+    let scn = io::Scenario::parse(text).map_err(|e| wasm_bindgen::JsError::new(&e))?;
+    let feas = feasibility::build(&scn);
+    let trace = trace::run(&scn, &feas, algo);
+    postcard::to_allocvec(&(scn, feas, trace))
+        .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// JS glue (web/beamer.html): posts `{text, algo}` to the solve Worker and
+    /// resolves with the postcard bytes as a `Uint8Array`.
+    #[wasm_bindgen(js_name = solveText, catch)]
+    async fn solve_text_js(text: &str, algo: u8) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+/// Fetch a scenario URL, solve it in the Worker, and rebuild [`Loaded`].
+#[cfg(target_arch = "wasm32")]
+async fn solve_via_worker(url: &str, algo: u8) -> Result<Loaded, String> {
+    let text = fetch_scenario(url).await?;
+    let bytes = solve_text_js(&text, algo)
+        .await
+        .map_err(|e| format!("solve worker failed: {e:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+    let (scn, feas, trace): (io::Scenario, feasibility::Feasibility, Trace) =
+        postcard::from_bytes(&bytes).map_err(|e| format!("decode solve result: {e}"))?;
+    Ok(loaded_from_parts(scn, feas, trace))
+}
+
+/// Assemble a [`Loaded`] from an already-solved scenario: the GPU-side f32
+/// position/direction caches, the per-satellite event index, and the
+/// unserved-reason counts. Cheap (just maps the data), so it runs on the render
+/// thread even on wasm — where the expensive parse + solve happen in a worker.
+fn loaded_from_parts(scn: io::Scenario, feas: feasibility::Feasibility, trace: Trace) -> Loaded {
     let user_pos: Vec<Vec3> = scn
         .users
         .iter()
@@ -2119,7 +2166,7 @@ fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
     for (i, e) in trace.events.iter().enumerate() {
         sat_events[e.sat as usize].push(i as u32);
     }
-    Ok(Loaded {
+    Loaded {
         scn,
         feas,
         user_pos,
@@ -2131,7 +2178,7 @@ fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
         trace,
         sat_events,
         reason_counts,
-    })
+    }
 }
 
 /// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
@@ -2369,4 +2416,36 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), wasm_bindge
     eframe::WebRunner::new()
         .start(canvas, web_options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The viz solve Worker serializes (Scenario, Feasibility, Trace) with postcard
+    // and the render thread deserializes it. Exercise that round-trip natively so
+    // the cross-Worker handoff can't silently drift.
+    #[test]
+    fn solve_roundtrip_postcard() {
+        let text = include_str!("../../test_cases/03_five_users.txt");
+        let scn = io::Scenario::parse(text).unwrap();
+        let feas = feasibility::build(&scn);
+        let trace = trace::run(&scn, &feas, Algorithm::Optimized);
+        let (n_users, n_sats, n_events, n_ids) =
+            (scn.users.len(), scn.sats.len(), trace.events.len(), scn.user_ids.len());
+
+        let bytes = postcard::to_allocvec(&(&scn, &feas, &trace)).unwrap();
+        let (scn2, feas2, trace2): (io::Scenario, feasibility::Feasibility, Trace) =
+            postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(scn2.users.len(), n_users);
+        assert_eq!(scn2.user_ids.len(), n_ids);
+        assert_eq!(feas2.feasible_users, feas.feasible_users);
+        assert_eq!(trace2.events.len(), n_events);
+
+        // The deserialized parts must rebuild a Loaded with consistent caches.
+        let l = loaded_from_parts(scn2, feas2, trace2);
+        assert_eq!(l.sat_pos.len(), n_sats);
+        assert_eq!(l.sat_events.len(), n_sats);
+    }
 }

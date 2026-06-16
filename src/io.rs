@@ -5,6 +5,7 @@ use std::io::{self, BufWriter, Write};
 
 /// A parsed scenario. Satellite and user ids are arbitrary strings in the input
 /// (preserved verbatim for output) but interned to dense indices for the solver.
+#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
 pub struct Scenario {
     pub sat_ids: Vec<String>,
     pub user_ids: Vec<String>,

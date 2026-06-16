@@ -36,7 +36,7 @@ default = ["parallel", "viz"]
 parallel = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 # The GPU visualizer and its native-only dependencies. On by default; off when
 # building just the headless solver/library (notably for WASM).
-viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu", "dep:ehttp"]
+viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu", "dep:ehttp", "dep:serde", "dep:postcard", "dep:js-sys"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
@@ -44,6 +44,10 @@ arrayvec = "0.7"
 # std::time::Instant panics on wasm32-unknown-unknown; web-time is an API-identical
 # drop-in (a zero-cost std re-export off-wasm, Performance.now()-backed on wasm).
 web-time = "1"
+# Serialize the solve output (Scenario + Feasibility + Trace) across the viz's
+# Web Worker boundary. Behind `viz`; the derives are #[cfg_attr(feature="viz")].
+serde = { version = "1", features = ["derive"], optional = true }
+postcard = { version = "1", features = ["alloc"], optional = true }
 
 # GPU visualizer (only linked into the beamer binary, behind the `viz` feature).
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"], optional = true }
@@ -72,6 +76,8 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 wgpu = { version = "22", features = ["webgl"], optional = true }
 # Async scenario fetch (no std::fs on wasm).
 ehttp = { version = "0.5", optional = true }
+# js-sys for the Uint8Array returned by the solve Worker.
+js-sys = { version = "0.3", optional = true }
 
 [profile.dev]
 opt-level = 1

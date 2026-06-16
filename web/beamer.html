@@ -20,9 +20,29 @@
   <div id="msg">loading beamer…</div>
 <script type="module">
 const msg = document.getElementById('msg');
+const v = Date.now();
+
+// The solve runs off the render thread (the 100k solve is ~32s). This worker
+// runs the serial solver and returns the result serialized; window.solveText is
+// what the viz wasm calls (the `solveText` import). Define it BEFORE start().
+const solveWorker = new Worker('./viz-solve-worker.js?v=' + v, { type: 'module' });
+let solveSeq = 0;
+const solvePending = new Map();
+solveWorker.onmessage = ({ data }) => {
+  const p = solvePending.get(data.id);
+  if (!p) return;
+  solvePending.delete(data.id);
+  if (data.error) p.reject(new Error(data.error));
+  else p.resolve(data.bytes);
+};
+window.solveText = (text, algo) => new Promise((resolve, reject) => {
+  const id = ++solveSeq;
+  solvePending.set(id, { resolve, reject });
+  solveWorker.postMessage({ id, text, algo });
+});
+
 try {
   // Cache-bust both the JS glue and the wasm so a rebuild is always picked up.
-  const v = Date.now();
   const mod = await import('./viz-pkg/beam_planner.js?v=' + v);
   await mod.default({ module_or_path: './viz-pkg/beam_planner_bg.wasm?v=' + v });
   await mod.start(document.getElementById('beamer'));

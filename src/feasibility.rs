@@ -8,6 +8,7 @@ use crate::index::Grid;
 use crate::io::Scenario;
 use crate::par::*;
 
+#[cfg_attr(feature = "viz", derive(serde::Serialize, serde::Deserialize))]
 pub struct Feasibility {
     /// `sats[u]` = sorted satellite indices user `u` may be served by.
     pub sats: Vec<Vec<u32>>,
