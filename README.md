@@ -230,6 +230,18 @@ The 100k case splits into thousands of independent components, so it parallelize
 serial. Reach for the threaded build when the 100k-class solve time matters;
 otherwise serial is simpler and needs no special headers.
 
+**The visualizer runs in the browser too** (MVP). `./web/build.sh --viz` compiles
+the whole eframe/egui/wgpu app to wasm, and [`web/beamer.html`](web/beamer.html)
+mounts it on a `<canvas>` via eframe's `WebRunner` — the globe, live nebula, HUD,
+and an embedded scenario solved inline. It renders through **WebGL2**: eframe 0.29
+ships wgpu 22, whose WebGPU path requests a device limit
+(`maxInterStageShaderComponents`) that current browsers removed, so the entry
+forces `Backends::GL` and the build enables wgpu's `webgl` feature. The viz `[[bin]]`
+moved into the library (`src/viz/`) so wasm-bindgen can emit it; native and headless
+modes are `#[cfg(not(target_arch = "wasm32"))]`-gated. Live basemap tiles and the
+threaded 100k solve (off the render loop, in a worker) are the remaining steps
+toward full parity.
+
 ## Visualizer — Beamer
 
 `beamer` is a GPU-rendered, interactive 3D globe built straight into the app

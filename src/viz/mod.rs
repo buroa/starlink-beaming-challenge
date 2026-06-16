@@ -605,23 +605,36 @@ impl App {
             wgpu::FilterMode::Linear,
         );
 
-        let mut scenarios: Vec<(String, String)> = std::fs::read_dir(test_cases_dir())
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "txt").unwrap_or(false))
-                    .map(|p| {
-                        let label = p
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        (label, p.to_string_lossy().into_owned())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        scenarios.sort();
+        // Native: scan ./test_cases for *.txt — the second tuple field is a PATH,
+        // read lazily at solve time (the 100k file is 6.7 MB).
+        #[cfg(not(target_arch = "wasm32"))]
+        let scenarios: Vec<(String, String)> = {
+            let mut s: Vec<(String, String)> = std::fs::read_dir(test_cases_dir())
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map(|x| x == "txt").unwrap_or(false))
+                        .map(|p| {
+                            let label = p
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            (label, p.to_string_lossy().into_owned())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            s.sort();
+            s
+        };
+        // WASM has no filesystem: embed one scenario. Here the second tuple field
+        // is the scenario TEXT (not a path); `load()` solves it inline.
+        #[cfg(target_arch = "wasm32")]
+        let scenarios: Vec<(String, String)> = vec![(
+            "00_example".to_string(),
+            include_str!("../../test_cases/00_example.txt").to_string(),
+        )];
 
         let mut app = App {
             scene,
@@ -692,17 +705,33 @@ impl App {
         // Invalidate per-frame caches keyed by the old scenario.
         self.last_compose_key = None;
         self.last_pick = None;
-        let Some((_, path)) = self.scenarios.get(self.current).cloned() else {
+        let Some((_, src)) = self.scenarios.get(self.current).cloned() else {
             self.error = Some("No scenarios found in ./test_cases".into());
             self.loading = None;
             return;
         };
         let algo = self.algo;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(load_scenario(&path, algo));
-        });
-        self.loading = Some(rx);
+        // Native: solve on a background thread (`src` is a path), polled in
+        // update() so the 100k case never freezes the window.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(load_scenario(&src, algo));
+            });
+            self.loading = Some(rx);
+        }
+        // WASM has no threads on the render loop: solve inline (`src` is the
+        // scenario text). Small scenarios solve in well under a frame; the
+        // heavy 100k case will move to a Web Worker in a later step.
+        #[cfg(target_arch = "wasm32")]
+        {
+            match build_loaded(&src, algo) {
+                Ok(l) => self.loaded = Some(l),
+                Err(e) => self.error = Some(e),
+            }
+            self.loading = None;
+        }
     }
 
     /// Re-solve (e.g. after an algorithm change). Re-parsing is cheap; the solve
@@ -1986,6 +2015,7 @@ fn style_egui(ctx: &egui::Context) {
 
 /// Locate the `test_cases` directory: explicit env var, then the working
 /// directory, then walking up from the executable's location.
+#[cfg(not(target_arch = "wasm32"))]
 fn test_cases_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("BEAM_TEST_CASES") {
         return p.into();
@@ -2019,9 +2049,16 @@ fn reason_idx(r: Reason) -> usize {
     REASONS.iter().position(|&x| x == r).unwrap_or(0)
 }
 
+/// Read a scenario file and solve it (native; `path` is a filesystem path).
+#[cfg(not(target_arch = "wasm32"))]
 fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let scn = io::Scenario::parse(&text).map_err(|e| format!("parse: {e}"))?;
+    build_loaded(&text, algo)
+}
+
+/// Parse + solve scenario text into a [`Loaded`] (platform-independent: no I/O).
+fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
+    let scn = io::Scenario::parse(text).map_err(|e| format!("parse: {e}"))?;
     let feas = feasibility::build(&scn);
     let trace = trace::run(&scn, &feas, algo);
     let user_pos: Vec<Vec3> = scn
@@ -2069,6 +2106,7 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
 
 /// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
 /// `--shot` and the `--frames` sequence renderer.
+#[cfg(not(target_arch = "wasm32"))]
 fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2086,6 +2124,7 @@ fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
 /// All scene layers on — the default look for headless stills and sequences.
 /// Interferers stay off here to keep the hero renders clean (their field is a
 /// hover-only overlay anyway).
+#[cfg(not(target_arch = "wasm32"))]
 fn full_view() -> ViewOpts {
     ViewOpts {
         bands: [true; 4],
@@ -2098,6 +2137,7 @@ fn full_view() -> ViewOpts {
 }
 
 /// Copy the scene's offscreen color texture back to the CPU and save it as a PNG.
+#[cfg(not(target_arch = "wasm32"))]
 fn save_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2154,6 +2194,7 @@ fn save_frame(
 
 /// Headless: render one frame of a scenario to a PNG (no window). Used to verify
 /// and preview the renderer. `--shot <scenario.txt> <out.png> [fraction 0..1]`.
+#[cfg(not(target_arch = "wasm32"))]
 fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
     let (w, h) = (1600u32, 1000u32);
     let (device, queue) = init_gpu()?;
@@ -2190,6 +2231,7 @@ fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
 /// `--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]`: the playback
 /// fraction sweeps 0→1 across the frames while the camera orbits by `orbit_degrees`
 /// total (default 0), so the beam network paints itself onto a slowly turning globe.
+#[cfg(not(target_arch = "wasm32"))]
 fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), String> {
     if n == 0 {
         return Err("n_frames must be > 0".into());
@@ -2229,6 +2271,7 @@ fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), Str
 
 /// Native entry point: parse CLI args (`--shot` / `--frames` headless modes) and
 /// otherwise launch the interactive window. Called by the thin `beamer` binary.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s == "--shot").unwrap_or(false) {
@@ -2274,4 +2317,26 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("Beamer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Browser entry point: mount the visualizer onto a `<canvas>`. Called from JS
+/// once the wasm module is initialized. Async because eframe brings the GPU
+/// surface up asynchronously. The `App::new` closure is identical to native.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
+    // Force the WebGL2 backend. wgpu 22 requests the `maxInterStageShaderComponents`
+    // device limit, which current browsers removed from the WebGPU spec, so the
+    // WebGPU `requestDevice` path is rejected. WebGL2 skips that negotiation.
+    // (Revisit once eframe/wgpu are on wgpu >= 23, where the limit is gone.)
+    let web_options = eframe::WebOptions {
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            supported_backends: wgpu::Backends::GL,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    eframe::WebRunner::new()
+        .start(canvas, web_options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+        .await
 }

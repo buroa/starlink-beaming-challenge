@@ -9,7 +9,9 @@
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use wgpu::util::DeviceExt;
 
@@ -327,14 +329,18 @@ impl TileGlobe {
         });
         let patch_indices = idx.len() as u32;
 
-        // Fetch workers.
+        // Fetch workers. Native only — wasm has no threads (and no ureq); tiles
+        // stay Off there, so the queue is never fed and these fields sit idle.
         let queue_shared = Arc::new((Mutex::new(VecDeque::<Job>::new()), Condvar::new()));
         let (res_tx, results) = std::sync::mpsc::channel::<TileMsg>();
+        #[cfg(not(target_arch = "wasm32"))]
         for _ in 0..WORKERS {
             let qs = queue_shared.clone();
             let tx = res_tx.clone();
             std::thread::spawn(move || worker(qs, tx));
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = res_tx; // no fetch workers on wasm
 
         TileGlobe {
             device,
@@ -652,6 +658,7 @@ fn visible(id: TileId, vp: Mat4, eye: Vec3, dist: f32) -> bool {
     ndc.x.abs() < 1.0 + margin && ndc.y.abs() < 1.0 + margin
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker(qs: Arc<(Mutex<VecDeque<Job>>, Condvar)>, tx: Sender<TileMsg>) {
     let (lock, cv) = &*qs;
     loop {

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Beamer · WebAssembly</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06090d; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #msg {
+    position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    color: #7d8893; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .15em; text-transform: uppercase; text-align: center; padding: 2rem;
+  }
+  #msg.err { color: #ff7b7b; }
+</style>
+</head>
+<body>
+  <canvas id="beamer"></canvas>
+  <div id="msg">loading beamer…</div>
+<script type="module">
+const msg = document.getElementById('msg');
+try {
+  // Cache-bust both the JS glue and the wasm so a rebuild is always picked up.
+  const v = Date.now();
+  const mod = await import('./viz-pkg/beam_planner.js?v=' + v);
+  await mod.default({ module_or_path: './viz-pkg/beam_planner_bg.wasm?v=' + v });
+  await mod.start(document.getElementById('beamer'));
+  msg.remove(); // eframe owns the canvas now
+} catch (e) {
+  msg.classList.add('err');
+  msg.textContent = 'Beamer failed to start: ' + ((e && e.message) || e);
+  console.error(e);
+}
+</script>
+</body>
+</html>
