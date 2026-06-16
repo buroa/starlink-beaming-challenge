@@ -1,0 +1,41 @@
+[package]
+name = "beam-planner"
+version = "1.0.0"
+edition = "2021"
+description = "Starlink beam planning solver + GPU visualizer."
+
+[lib]
+name = "beam_planner"
+path = "src/lib.rs"
+
+# The solver: scenario in, validator-format solution out.
+[[bin]]
+name = "beam-planner"
+path = "src/bin/solver.rs"
+
+# The interactive GPU visualizer ("Beamer").
+[[bin]]
+name = "beamer"
+path = "src/bin/viz/main.rs"
+
+[dependencies]
+rayon = "1"
+arrayvec = "0.7"
+
+# GPU visualizer (only linked into the beam-viz binary).
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "0.3"
+ureq = "2"
+
+[profile.dev]
+opt-level = 1
+split-debuginfo = "packed"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
