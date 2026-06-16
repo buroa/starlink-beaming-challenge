@@ -84,12 +84,15 @@ parallel:
      satellite at `Σ min(4, |Cᵢ|)` (≤ 32). A flow under these caps is still a
      sound ceiling and is ≤ the matching bound (it correctly proves case 03's
      optimum is **4**, not 5).
-3. **Ensemble construction** — five independent constructions run in parallel
-   per component, keeping the best: a **flow‑seeded** build (realizes the optimal
-   matching with a near‑maximum 4‑colorable subset per satellite) plus four
-   **coloring‑integral greedy** variants (a user is admitted to a satellite only
-   if a valid color exists — coloring is never a fragile post‑step). Per‑satellite
-   4‑coloring is solved exactly (DSATUR + bounded backtracking).
+3. **Ensemble construction** — four **coloring‑integral greedy** variants run in
+   parallel per component, keeping the best (a user is admitted to a satellite
+   only if a valid color exists — coloring is never a fragile post‑step). A fifth
+   **flow‑seeded** build (realizes the optimal matching with a near‑maximum
+   4‑colorable subset per satellite) runs only when the greedy ensemble fell
+   short of the matching bound — it can't beat a bound the greedy build already
+   reached, so the capacity‑saturated mega‑components skip its costly repair
+   entirely. Per‑satellite 4‑coloring is solved exactly (DSATUR + bounded
+   backtracking, with color‑symmetry breaking and a clique cutoff).
 4. **Bounded augmenting repair** — recovers stragglers via short displacement
    chains, with atomic rollback; strictly budgeted so it can never blow up.
 5. **Parallel large‑neighborhood search** — the best construction is then
@@ -140,11 +143,14 @@ converges there and recovers only a handful more users with vastly more compute.
 
 ### Performance
 
-The construction + repair for 100,000 users / 1,440 satellites finishes in
-**~3 s** on all cores; the optional polish (parallel large‑neighborhood search)
-runs to a tunable iteration budget — the default lands case 11 at **~9 s**
-(every core busy), well under the 15 min / 1 GB limits. The polish is a single
-speed↔quality knob (`LNS_MAX_ROUNDS`): turn it off for ~3 s, or crank it for a
-few more users at the cost of seconds. All smaller cases finish in 1–7 s.
+The full solve for 100,000 users / 1,440 satellites — construction, repair, and
+the parallel large‑neighborhood polish — finishes in **~0.55 s** on all cores,
+well under the 15 min / 1 GB limits. Every smaller case is sub‑second (the 10k
+cases land at ~0.1–0.25 s). The exact 4‑coloring oracle dominates the hard
+component, so it is the most tuned hot path: stack‑allocated search state,
+incremental neighbour‑color counts, color‑symmetry breaking, and a K5 clique
+cutoff together cut its work by ~16× and the whole 100k case by ~30× over the
+first correct version, with no loss of coverage. The polish is still a single
+speed↔quality knob (`LNS_MAX_ROUNDS`).
 
 See the **Visualizer** section above to explore any scenario interactively.

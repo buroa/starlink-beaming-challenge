@@ -696,39 +696,53 @@ fn solve_component(
             .then(pa.z.total_cmp(&pb.z))
     });
 
-    // Ensemble of independent constructions; no single one wins every component,
-    // so we keep the best. They don't interact, so they run in parallel — which
-    // also shortens the largest component's critical path.
-    //   0: flow-seeded (optimal capacity allocation, max-colorable realization)
-    //   1: greedy, least-loaded sats          2: greedy, highest-elevation sats
-    //   3: greedy, least-contended sats        4: greedy, spatial order + highest elevation
-    let mut runs: Vec<(usize, CompSolver)> = (0u32..5)
+    // Ensemble of independent greedy constructions; no single sat-ordering wins
+    // every component, so we keep the best. They don't interact, so they run in
+    // parallel — which also shortens the largest component's critical path.
+    //   0: least-loaded sats        1: highest-elevation sats
+    //   2: least-contended sats     3: spatial user order + highest elevation
+    let mut runs: Vec<(usize, CompSolver)> = (0u32..4)
         .into_par_iter()
         .map(|cfg| {
             let (sat_choice, ord) = match cfg {
-                2 => (SatChoice::HighestElevation, &order),
-                3 => (SatChoice::LeastContended, &order),
-                4 => (SatChoice::HighestElevation, &order_pos),
+                1 => (SatChoice::HighestElevation, &order),
+                2 => (SatChoice::LeastContended, &order),
+                3 => (SatChoice::HighestElevation, &order_pos),
                 _ => (SatChoice::LeastLoaded, &order),
             };
             let mut solver = CompSolver::new(scn, c, &local_feas, &sat_deg, sat_choice);
-            let ach = if cfg == 0 {
-                solver.seed_and_repair(&matching, ord, upper_bound, deadline)
-            } else {
-                solver.solve(ord, upper_bound, deadline)
-            };
+            let ach = solver.solve(ord, upper_bound, deadline);
             (ach, solver)
         })
         .collect();
-
-    // Keep the best; ties resolve to the lowest member index (deterministic).
+    // Best greedy; ties resolve to the lowest member index (deterministic).
     let mut best_idx = 0;
     for i in 1..runs.len() {
         if runs[i].0 > runs[best_idx].0 {
             best_idx = i;
         }
     }
-    let (best_seed_ach, seed_solver) = runs.swap_remove(best_idx);
+    let best_greedy_ach = runs[best_idx].0;
+
+    // Flow-seeded construction: realize the optimal max-flow matching, then
+    // repair. Its only edge over greedy is recovering capacity that greedy left
+    // on the table, so it cannot help once greedy already reaches the matching
+    // upper bound — and its repair over a flow-saturated graph is by far the
+    // costliest construction. So run it only when greedy fell short; on the
+    // capacity-bound mega-components (already at the bound) we skip it entirely.
+    // When it does run it wins ties, matching the canonical capacity-optimal
+    // layout.
+    let (best_seed_ach, seed_solver) = if best_greedy_ach < upper_bound {
+        let mut fs = CompSolver::new(scn, c, &local_feas, &sat_deg, SatChoice::LeastLoaded);
+        let fs_ach = fs.seed_and_repair(&matching, &order, upper_bound, deadline);
+        if fs_ach >= best_greedy_ach {
+            (fs_ach, fs)
+        } else {
+            runs.swap_remove(best_idx)
+        }
+    } else {
+        runs.swap_remove(best_idx)
+    };
 
     // Polish with large-neighborhood search. The LNS of a single component is
     // serial, so the giant component would pin one core while the rest idle —

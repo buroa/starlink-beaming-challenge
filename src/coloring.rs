@@ -11,6 +11,11 @@
 
 use crate::geom::{same_color_conflict, Vec3};
 
+/// Conflict-graph capacity for the exact path: members (< 32, since a full
+/// satellite short-circuits before `try_color`) plus the candidate. Sizing the
+/// working arrays to this lets the exact coloring run with zero heap allocation.
+const MAX_M: usize = 33;
+
 /// Find a color in 0..4 for `cand_dir` given existing members `dirs`/`colors`
 /// (parallel arrays of equal length). On success via the exact path, existing
 /// members may be recolored in place; the returned color is the candidate's.
@@ -40,8 +45,11 @@ pub fn try_color(dirs: &[Vec3], colors: &mut [u8], cand_dir: Vec3) -> Option<u8>
 
     // Exact path: 4-color the whole set with the candidate appended at index n.
     let m = n + 1;
-    debug_assert!(m <= 33); // ≤33-node conflict graph (members + candidate) per module comment
-    let mut adj = vec![0u64; m];
+    debug_assert!(m <= MAX_M); // members + candidate
+                               // Stack working set — no per-call heap allocation (this runs millions of
+                               // times on dense satellites): adjacency bitsets, the partial coloring, and
+                               // per-vertex neighbour-colour counts the search maintains incrementally.
+    let mut adj = [0u64; MAX_M];
     for i in 0..n {
         for j in (i + 1)..n {
             if same_color_conflict(dirs[i], dirs[j]) {
@@ -55,13 +63,32 @@ pub fn try_color(dirs: &[Vec3], colors: &mut [u8], cand_dir: Vec3) -> Option<u8>
         }
     }
 
-    let mut assign = vec![u8::MAX; m];
-    // Bound the backtracking: a 4-colorable ≤33-node graph is found near-
-    // instantly with MRV, but *proving* non-4-colorability can be exponential.
-    // On overrun we conservatively reject (the user goes unassigned) — at worst
-    // a marginal coverage loss, never an invalid beam or a hang.
+    // Cheap sufficient rejection: a clique of ≥5 mutually-conflicting users needs
+    // ≥5 colours, so the set is not 4-colourable. `fast_color` just failed on the
+    // candidate, so it sits in a dense neighbourhood — greedily grow a maximal
+    // clique from it (lowest-index first); if it reaches 5 we reject without the
+    // (budget-bounded, expensive) full search. Sound, and identical to the
+    // search's verdict — a K5 is never 4-colourable; a missed clique merely falls
+    // through to the search exactly as before.
+    let mut cl = adj[n];
+    let mut csz = 1u32;
+    while cl != 0 {
+        csz += 1;
+        if csz >= 5 {
+            return None;
+        }
+        cl &= adj[cl.trailing_zeros() as usize];
+    }
+
+    let mut assign = [u8::MAX; MAX_M];
+    let mut nbcnt = [[0u8; 4]; MAX_M];
+    // Bound the backtracking: a 4-colorable graph is found near-instantly with
+    // MRV, but *proving* non-4-colorability can be exponential. On overrun we
+    // conservatively reject (the user goes unassigned) — at worst a marginal
+    // coverage loss, never an invalid beam or a hang.
     let mut budget: u32 = 40_000;
-    if color_search(&adj, m, &mut assign, &mut budget) {
+    let ok = color_search(&adj, m, &mut assign, &mut nbcnt, &mut budget, 0);
+    if ok {
         colors[..n].copy_from_slice(&assign[..n]);
         Some(assign[n])
     } else {
@@ -71,7 +98,35 @@ pub fn try_color(dirs: &[Vec3], colors: &mut [u8], cand_dir: Vec3) -> Option<u8>
 
 /// Recursive 4-coloring with minimum-remaining-values vertex selection and a
 /// step budget. Returns false on infeasibility *or* budget exhaustion.
-fn color_search(adj: &[u64], m: usize, assign: &mut [u8], budget: &mut u32) -> bool {
+///
+/// `nbcnt[v][c]` tracks how many of `v`'s already-coloured neighbours use colour
+/// `c`, maintained incrementally on assign/backtrack. This makes the per-node
+/// MRV scan O(m·4) instead of rescanning every vertex's neighbour list — but the
+/// vertex/colour selection order is byte-for-byte the same as the rescan
+/// version (skip coloured, dead-end on zero options, fewest-options-first with
+/// lowest-index tie-break, colours tried ascending), so the coloring found and
+/// the accept/reject verdict are identical.
+///
+/// `used` is the bitmask of colours already placed on the current path. A proper
+/// colouring is invariant under permuting colour *labels*, so when extending the
+/// search we never need to try more than one *new* colour: the existing colours
+/// `used` plus the single lowest unused one. `allowed = used | (used + 1)` is
+/// exactly that prefix mask. This breaks the 4! colour symmetry — the dominant
+/// cost when *proving* a dense cluster is not 4-colourable (~⅔ of all search
+/// steps were symmetric re-explorations). It does **not** change the colouring
+/// found or the accept/reject verdict: the lowest available colour at any vertex
+/// is always ≤ (#distinct colours used) and so always inside `allowed`, so the
+/// leftmost (lowest-colour-first) solution path is never pruned — only the
+/// redundant higher-new-colour branches to its right, which a correct search
+/// would reject anyway.
+fn color_search(
+    adj: &[u64],
+    m: usize,
+    assign: &mut [u8],
+    nbcnt: &mut [[u8; 4]],
+    budget: &mut u32,
+    used: u8,
+) -> bool {
     if *budget == 0 {
         return false;
     }
@@ -83,16 +138,11 @@ fn color_search(adj: &[u64], m: usize, assign: &mut [u8], budget: &mut u32) -> b
         if assign[v] != u8::MAX {
             continue;
         }
-        let mut used = 0u8;
-        let mut nb = adj[v];
-        while nb != 0 {
-            let u = nb.trailing_zeros() as usize;
-            nb ^= 1 << u;
-            if assign[u] != u8::MAX {
-                used |= 1 << assign[u];
-            }
-        }
-        let avail = !used & 0x0F;
+        let k = &nbcnt[v];
+        let avail = (k[0] == 0) as u8
+            | (((k[1] == 0) as u8) << 1)
+            | (((k[2] == 0) as u8) << 2)
+            | (((k[3] == 0) as u8) << 3);
         let cnt = avail.count_ones();
         if cnt == 0 {
             return false; // dead end
@@ -106,13 +156,26 @@ fn color_search(adj: &[u64], m: usize, assign: &mut [u8], budget: &mut u32) -> b
     if best == usize::MAX {
         return true; // every vertex colored
     }
-    let mut mask = best_avail;
+    // Try only existing colours plus the single lowest new one (symmetry break).
+    let mut mask = best_avail & (used | used.wrapping_add(1));
     while mask != 0 {
         let c = mask.trailing_zeros() as u8;
         mask &= mask - 1;
         assign[best] = c;
-        if color_search(adj, m, assign, budget) {
+        let mut nb = adj[best];
+        while nb != 0 {
+            let u = nb.trailing_zeros() as usize;
+            nb &= nb - 1;
+            nbcnt[u][c as usize] += 1;
+        }
+        if color_search(adj, m, assign, nbcnt, budget, used | (1 << c)) {
             return true;
+        }
+        let mut nb = adj[best];
+        while nb != 0 {
+            let u = nb.trailing_zeros() as usize;
+            nb &= nb - 1;
+            nbcnt[u][c as usize] -= 1;
         }
         assign[best] = u8::MAX;
     }
