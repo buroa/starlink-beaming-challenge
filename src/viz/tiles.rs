@@ -9,9 +9,7 @@
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::Receiver;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use wgpu::util::DeviceExt;
 
@@ -199,6 +197,9 @@ pub struct TileGlobe {
     failed: HashMap<TileId, (u64, u8)>,
     queue_shared: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
     results: Receiver<TileMsg>,
+    /// Sender side of `results`. Native clones it into the fetch worker threads;
+    /// wasm clones it into each async `fetch` task (it has no threads).
+    res_tx: Sender<TileMsg>,
     frame: u64,
     render_list: Vec<TileId>,
 }
@@ -339,8 +340,6 @@ impl TileGlobe {
             let tx = res_tx.clone();
             std::thread::spawn(move || worker(qs, tx));
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = res_tx; // no fetch workers on wasm
 
         TileGlobe {
             device,
@@ -358,6 +357,7 @@ impl TileGlobe {
             failed: HashMap::new(),
             queue_shared,
             results,
+            res_tx,
             frame: 0,
             render_list: Vec::new(),
         }
@@ -523,8 +523,7 @@ impl TileGlobe {
             let db = b.center_pos().distance_squared(eye);
             da.partial_cmp(&db).unwrap()
         });
-        let (lock, cv) = &*self.queue_shared;
-        let mut q = lock.lock().unwrap();
+        let mut to_fetch: Vec<TileId> = Vec::new();
         for id in want_request {
             if self.cache.contains_key(&id) || self.pending.contains(&id) {
                 continue;
@@ -537,16 +536,25 @@ impl TileGlobe {
                 self.failed.remove(&id);
             }
             self.pending.insert(id);
-            q.push_back(Job {
-                id,
-                spec,
-                gen: self.gen,
-            });
+            to_fetch.push(id);
         }
-        if !q.is_empty() {
+
+        // Native: hand the jobs to the worker thread pool. Wasm: kick off an
+        // async `fetch` per tile (the browser caps concurrency per origin); both
+        // deliver decoded tiles into `results`, drained at the top of update().
+        #[cfg(not(target_arch = "wasm32"))]
+        if !to_fetch.is_empty() {
+            let (lock, cv) = &*self.queue_shared;
+            let mut q = lock.lock().unwrap();
+            for id in to_fetch {
+                q.push_back(Job { id, spec, gen: self.gen });
+            }
             cv.notify_all();
         }
-        drop(q);
+        #[cfg(target_arch = "wasm32")]
+        for id in to_fetch {
+            spawn_tile_fetch(id, spec, self.gen, self.res_tx.clone());
+        }
 
         self.evict();
         !self.pending.is_empty()
@@ -658,6 +666,45 @@ fn visible(id: TileId, vp: Mat4, eye: Vec3, dist: f32) -> bool {
     ndc.x.abs() < 1.0 + margin && ndc.y.abs() < 1.0 + margin
 }
 
+/// Tile URL for a source + tile id. CARTO: `/z/x/y@2x.png`; Esri imagery:
+/// `/z/y/x` (no extension, returns jpeg).
+fn tile_url(spec: &SourceSpec, id: TileId) -> String {
+    if spec.yx {
+        format!("{}/{}/{}/{}", spec.url, id.z, id.y, id.x)
+    } else if spec.retina {
+        format!("{}/{}/{}/{}@2x.png", spec.url, id.z, id.x, id.y)
+    } else {
+        format!("{}/{}/{}/{}.png", spec.url, id.z, id.x, id.y)
+    }
+}
+
+/// Wasm tile fetch: `fetch` the tile, decode it, and post the result into
+/// `results` (the same channel the native worker threads use). The browser caps
+/// concurrent requests per origin, so kicking one off per missing tile is fine.
+#[cfg(target_arch = "wasm32")]
+fn spawn_tile_fetch(id: TileId, spec: SourceSpec, gen: u64, tx: Sender<TileMsg>) {
+    let url = tile_url(&spec, id);
+    wasm_bindgen_futures::spawn_local(async move {
+        let msg = match fetch_decode(&url).await {
+            Some((rgba, w, h)) => TileMsg::Loaded(Loaded { id, gen, rgba, w, h }),
+            None => TileMsg::Failed { id, gen },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_decode(url: &str) -> Option<(Vec<u8>, u32, u32)> {
+    let resp = ehttp::fetch_async(ehttp::Request::get(url)).await.ok()?;
+    if !resp.ok {
+        return None;
+    }
+    let img = image::load_from_memory(&resp.bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((rgba.into_raw(), w, h))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn worker(qs: Arc<(Mutex<VecDeque<Job>>, Condvar)>, tx: Sender<TileMsg>) {
     let (lock, cv) = &*qs;
@@ -672,14 +719,7 @@ fn worker(qs: Arc<(Mutex<VecDeque<Job>>, Condvar)>, tx: Sender<TileMsg>) {
             }
         };
         let Job { id, spec, gen } = job;
-        // CARTO: /z/x/y@2x.png. Esri imagery: /z/y/x (no extension, returns jpeg).
-        let url = if spec.yx {
-            format!("{}/{}/{}/{}", spec.url, id.z, id.y, id.x)
-        } else if spec.retina {
-            format!("{}/{}/{}/{}@2x.png", spec.url, id.z, id.x, id.y)
-        } else {
-            format!("{}/{}/{}/{}.png", spec.url, id.z, id.x, id.y)
-        };
+        let url = tile_url(&spec, id);
         let fail = |tx: &Sender<TileMsg>| {
             let _ = tx.send(TileMsg::Failed { id, gen });
         };

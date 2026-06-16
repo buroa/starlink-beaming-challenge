@@ -250,8 +250,12 @@ whose WebGPU path requests a device limit (`maxInterStageShaderComponents`) that
 current browsers removed, so the entry forces `Backends::GL` and the build enables
 wgpu's `webgl` feature. The viz `[[bin]]` moved into the library (`src/viz/`) so
 wasm-bindgen can emit it; native and headless modes are
-`#[cfg(not(target_arch = "wasm32"))]`-gated. Live basemap tiles (an async-fetch
-port of the native tile streamer) are the one remaining step toward full parity.
+`#[cfg(not(target_arch = "wasm32"))]`-gated. **Live basemap tiles** stream too: the
+native streamer's 8-thread + `ureq` model is ported to per-tile async `fetch` on
+wasm (keeping the quadtree refinement, LRU cache, and `image` decode — only the
+execution model changes), and the web build defaults the basemap on. The
+visualizer now runs at **full parity in the browser** — render, all 12 scenarios,
+the parallel solve, and live tiles.
 
 ## Visualizer — Beamer
 

@@ -679,6 +679,14 @@ impl App {
             last_pick: None,
         };
         style_egui(&cc.egui_ctx);
+        // On the web, default the basemap on to show off the live tile streaming
+        // (Off — the transparent globe over the nebula — is one click away in the
+        // Basemap picker).
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.tile_source = tiles::TileSource::Dark;
+            app.scene.set_tile_source(tiles::TileSource::Dark);
+        }
         // Native opens on the headline 100k case; wasm solves inline (for now), so
         // default to a fast, globe-filling scenario instead.
         #[cfg(not(target_arch = "wasm32"))]
