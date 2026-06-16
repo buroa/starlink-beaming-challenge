@@ -18,7 +18,8 @@ struct CameraUniform {
     inv_view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
     sun_dir: [f32; 4],
-    params: [f32; 4], // viewport.x, viewport.y, time, _
+    params: [f32; 4],  // viewport.x, viewport.y, time, map_style
+    params2: [f32; 4], // load_pulse, _, _, _
 }
 
 #[repr(C)]
@@ -79,6 +80,12 @@ pub struct Scene {
     /// Draw the Fresnel atmosphere halo? Controlled independently of the basemap
     /// via [`Scene::set_atmosphere`], so the hue can glow over a transparent earth.
     draw_atmo: bool,
+    /// Solve/loading animation pulse (>0 while a background solve is in flight),
+    /// fed to the background shader for the screen-centered wavefront.
+    load_t: f32,
+    /// Satellite-focus mode: suppress the globe + atmosphere so the flat ground
+    /// plane stands alone over the nebula, regardless of basemap/halo settings.
+    focus_mode: bool,
 
     size: (u32, u32),
     color_tex: wgpu::Texture,
@@ -318,6 +325,8 @@ impl Scene {
             beam_count: 0,
             map_style: 0.0,
             draw_atmo: false,
+            load_t: 0.0,
+            focus_mode: false,
             size,
             color_tex,
             color_view,
@@ -365,6 +374,18 @@ impl Scene {
         self.draw_atmo = on;
     }
 
+    /// Drive the background's loading wavefront. Pass the elapsed time while a
+    /// background solve is in flight, or 0.0 to switch the effect off.
+    pub fn set_load(&mut self, t: f32) {
+        self.load_t = t;
+    }
+
+    /// Enter/leave satellite-focus mode: hides the globe + atmosphere so the
+    /// flat ground plane reads cleanly over the nebula backdrop.
+    pub fn set_focus_mode(&mut self, on: bool) {
+        self.focus_mode = on;
+    }
+
     pub fn set_camera(&self, view_proj: Mat4, cam_pos: Vec3, sun: Vec3, time: f32) {
         let inv = view_proj.inverse();
         let u = CameraUniform {
@@ -373,6 +394,7 @@ impl Scene {
             cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 1.0],
             sun_dir: [sun.x, sun.y, sun.z, 0.0],
             params: [self.size.0 as f32, self.size.1 as f32, time, self.map_style],
+            params2: [self.load_t, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
@@ -445,12 +467,15 @@ impl Scene {
             pass.set_pipeline(&self.bg_pipeline);
             pass.draw(0..3, 0..1);
 
-            // Live satellite globe (group 0 camera already bound).
-            self.tile_globe.render(&mut pass);
+            // Live satellite globe (group 0 camera already bound). Suppressed in
+            // satellite-focus mode, where the flat ground plane replaces it.
+            if !self.focus_mode {
+                self.tile_globe.render(&mut pass);
+            }
 
             // Fresnel atmosphere halo — toggled independently of the basemap
             // (see set_atmosphere), so the glow can ride over a transparent earth.
-            if self.draw_atmo {
+            if self.draw_atmo && !self.focus_mode {
                 pass.set_pipeline(&self.atmo_pipeline);
                 pass.set_vertex_buffer(0, self.globe_vbuf.slice(..));
                 pass.set_index_buffer(self.globe_ibuf.slice(..), wgpu::IndexFormat::Uint32);

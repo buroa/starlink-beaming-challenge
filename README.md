@@ -4,10 +4,10 @@ A fast, fully parallel, deterministic solver for the SpaceX Starlink Beam
 Planning tech test — plus a GPU globe to watch it work.
 
 <p align="center">
-  <img src="docs/beamer.gif" width="600"
-       alt="Beamer rendering the 100,000-user scenario: beams paint onto a transparent, slowly turning globe">
+  <img src="docs/beamer.webp" width="600"
+       alt="Beamer rendering the 100,000-user scenario: beams paint onto a transparent, slowly turning globe over a live nebula">
   <br>
-  <em>Beamer solving the 100,000-user case (<code>11</code>) — the beam network painting itself onto a transparent globe.</em>
+  <em>Beamer solving the 100,000-user case (<code>11</code>) — the beam network painting itself onto a transparent globe over a living nebula.</em>
 </p>
 
 Given Starlink satellites, users, and non-Starlink "interferer" satellites in
@@ -208,15 +208,16 @@ Two headless modes render without a window: `beamer --shot <scenario> <out.png>
 [fraction]` writes a single frame to a PNG, and `beamer --frames <scenario>
 <dir> <n> [orbit°]` solves once and writes an `n`-frame playback sweep (with an
 optional camera orbit) as numbered PNGs. The looping demo at the top of this page
-was made with the latter, then encoded with ffmpeg:
+is a full-color animated **WebP** (much smaller than a 256-color GIF), made with
+`ffmpeg` (downscale) + `img2webp` (encode):
 
 ```sh
 beamer --frames test_cases/11_one_hundred_thousand_users.txt /tmp/frames 60 16
-ffmpeg -framerate 20 -i /tmp/frames/frame_%05d.png \
-  -vf "scale=600:-1:flags=lanczos,palettegen=stats_mode=full" /tmp/palette.png
-ffmpeg -framerate 20 -i /tmp/frames/frame_%05d.png -i /tmp/palette.png \
-  -lavfi "scale=600:-1:flags=lanczos,tpad=stop_mode=clone:stop_duration=1.0[x];[x][1:v]paletteuse=dither=sierra2_4a" \
-  docs/beamer.gif
+# downscale the frames to 600px wide
+ffmpeg -i /tmp/frames/frame_%05d.png -vf "scale=600:-1:flags=lanczos" /tmp/f/frame_%05d.png
+# encode an animated WebP, holding the last (full-coverage) frame for a beat
+img2webp -loop 0 -lossy -q 84 -m 6 \
+  -d 50 /tmp/f/frame_*.png -d 1500 /tmp/f/frame_00060.png -o docs/beamer.webp
 ```
 
 Basemaps © OpenStreetMap contributors © CARTO; satellite imagery © Esri.

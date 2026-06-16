@@ -96,8 +96,10 @@ impl Sat {
         }
     }
 
+    /// Remove `user`, returning its stored direction (so a re-seat can reuse it
+    /// instead of recomputing `unit(sat-user)`).
     #[inline]
-    fn remove(&mut self, user: u32) {
+    fn remove(&mut self, user: u32) -> Vec3 {
         let i = self
             .users
             .iter()
@@ -105,7 +107,7 @@ impl Sat {
             .expect("member present");
         self.users.swap_remove(i);
         self.colors.swap_remove(i);
-        self.dirs.swap_remove(i);
+        self.dirs.swap_remove(i)
     }
 
     #[inline]
@@ -188,13 +190,6 @@ impl<'a> CompSolver<'a> {
             .unit()
     }
 
-    #[inline]
-    fn elevation(&self, lu: u32, ls: u32) -> f64 {
-        self.scn.users[self.g_users[lu as usize] as usize]
-            .unit()
-            .dot(self.dir(lu, ls))
-    }
-
     /// Feasible sats of local user `lu`, ordered by the chosen heuristic.
     fn ordered_candidates(&self, lu: u32) -> ArrayVec<u32, 16> {
         let mut cs: ArrayVec<u32, 16> = self.feas[lu as usize].iter().copied().collect();
@@ -212,12 +207,18 @@ impl<'a> CompSolver<'a> {
                     s,
                 )
             }),
-            // Highest elevation (most overhead) first.
-            SatChoice::HighestElevation => cs.sort_unstable_by(|&a, &b| {
-                self.elevation(lu, b)
-                    .total_cmp(&self.elevation(lu, a))
-                    .then(a.cmp(&b))
-            }),
+            // Highest elevation (most overhead) first. Decorate-sort: compute the
+            // user zenith once and each candidate's elevation once, instead of
+            // re-deriving both unit vectors twice per comparison (O(k) sqrts, not
+            // O(k log k)). Bit-identical keys ⇒ identical order ⇒ deterministic.
+            SatChoice::HighestElevation => {
+                let zenith =
+                    self.scn.users[self.g_users[lu as usize] as usize].unit();
+                let mut keyed: ArrayVec<(f64, u32), 16> =
+                    cs.iter().map(|&s| (zenith.dot(self.dir(lu, s)), s)).collect();
+                keyed.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                cs = keyed.iter().map(|&(_, s)| s).collect();
+            }
         }
         cs
     }
@@ -319,7 +320,7 @@ impl<'a> CompSolver<'a> {
                 if self.budget == 0 {
                     return false;
                 }
-                self.sats[s as usize].remove(m);
+                let dm = self.sats[s as usize].remove(m); // m's dir, reused below
                 self.set_user(m, -1);
                 if self.sats[s as usize].try_insert(x, dx, recolor) {
                     self.set_user(x, s as i32);
@@ -334,9 +335,9 @@ impl<'a> CompSolver<'a> {
                 match &snap {
                     // Recolor path: restore s exactly (handles any relabel).
                     Some(snap) => self.sats[s as usize].clone_from(snap),
-                    // Fast path: m's original color is still free among the rest.
+                    // Fast path: m's original color is still free among the rest;
+                    // its direction is the one we just removed (no recompute).
                     None => {
-                        let dm = self.dir(m, s);
                         self.sats[s as usize].try_insert(m, dm, false);
                     }
                 }
@@ -590,11 +591,13 @@ impl<'a> CompSolver<'a> {
             let cands: ArrayVec<u32, 16> = self.feas[x as usize].iter().copied().collect();
             for &s in &cands {
                 self.touch_sat(s);
-                for u in self.sats[s as usize].users.clone() {
+                // Move the satellite out (leaving it reset) and drain its users —
+                // no clone of the member list, and the take already does the reset.
+                let taken = std::mem::take(&mut self.sats[s as usize]);
+                for &u in &taken.users {
                     self.set_user(u, -1);
                     freed.push(u);
                 }
-                self.sats[s as usize] = Sat::default();
             }
             // Recreate: re-seat the freed users in a perturbed most-constrained
             // order (the perturbation is what makes successive rounds explore
