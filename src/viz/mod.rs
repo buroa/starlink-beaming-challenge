@@ -628,13 +628,18 @@ impl App {
             s.sort();
             s
         };
-        // WASM has no filesystem: embed one scenario. Here the second tuple field
-        // is the scenario TEXT (not a path); `load()` solves it inline.
+        // WASM has no filesystem: the second tuple field is a URL (relative to
+        // web/beamer.html), fetched on demand by `load()`.
         #[cfg(target_arch = "wasm32")]
-        let scenarios: Vec<(String, String)> = vec![(
-            "00_example".to_string(),
-            include_str!("../../test_cases/00_example.txt").to_string(),
-        )];
+        let scenarios: Vec<(String, String)> = [
+            "00_example", "01_simplest_possible", "02_two_users", "03_five_users",
+            "04_one_interferer", "05_equatorial_plane", "06_partially_fullfillable",
+            "07_eighteen_planes", "08_eighteen_planes_northern", "09_ten_thousand_users",
+            "10_ten_thousand_users_geo_belt", "11_one_hundred_thousand_users",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), format!("../test_cases/{n}.txt")))
+        .collect();
 
         let mut app = App {
             scene,
@@ -674,8 +679,13 @@ impl App {
             last_pick: None,
         };
         style_egui(&cc.egui_ctx);
-        // Open on the headline 100k-user scenario and start playing immediately.
-        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with("11")) {
+        // Native opens on the headline 100k case; wasm solves inline (for now), so
+        // default to a fast, globe-filling scenario instead.
+        #[cfg(not(target_arch = "wasm32"))]
+        let default_prefix = "11";
+        #[cfg(target_arch = "wasm32")]
+        let default_prefix = "07";
+        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with(default_prefix)) {
             app.current = i;
         }
         app.load();
@@ -721,16 +731,22 @@ impl App {
             });
             self.loading = Some(rx);
         }
-        // WASM has no threads on the render loop: solve inline (`src` is the
-        // scenario text). Small scenarios solve in well under a frame; the
-        // heavy 100k case will move to a Web Worker in a later step.
+        // WASM: `src` is a URL. Fetch it asynchronously (so the UI stays
+        // responsive while it downloads), then solve. The result is delivered
+        // through the same mpsc channel the native path uses, so update()'s poll
+        // is unchanged. The solve itself still runs on the render thread here;
+        // the heavy cases move to a Web Worker in the next step.
         #[cfg(target_arch = "wasm32")]
         {
-            match build_loaded(&src, algo) {
-                Ok(l) => self.loaded = Some(l),
-                Err(e) => self.error = Some(e),
-            }
-            self.loading = None;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.loading = Some(rx);
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = match fetch_scenario(&src).await {
+                    Ok(text) => build_loaded(&text, algo),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(result);
+            });
         }
     }
 
@@ -2054,6 +2070,20 @@ fn reason_idx(r: Reason) -> usize {
 fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     build_loaded(&text, algo)
+}
+
+/// Fetch a scenario's text over HTTP (wasm; `url` is relative to the page).
+#[cfg(target_arch = "wasm32")]
+async fn fetch_scenario(url: &str) -> Result<String, String> {
+    let resp = ehttp::fetch_async(ehttp::Request::get(url))
+        .await
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+    if !resp.ok {
+        return Err(format!("fetch {url}: HTTP {}", resp.status));
+    }
+    resp.text()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{url}: response was not valid UTF-8"))
 }
 
 /// Parse + solve scenario text into a [`Loaded`] (platform-independent: no I/O).

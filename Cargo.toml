@@ -36,7 +36,7 @@ default = ["parallel", "viz"]
 parallel = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 # The GPU visualizer and its native-only dependencies. On by default; off when
 # building just the headless solver/library (notably for WASM).
-viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu"]
+viz = ["dep:eframe", "dep:egui", "dep:bytemuck", "dep:glam", "dep:image", "dep:pollster", "dep:ureq", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:wgpu", "dep:ehttp"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
@@ -70,6 +70,8 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # Backends::GL (wgpu 22's WebGPU path is rejected by current browsers). Feature-
 # unifies with eframe's wgpu — both backends compiled, GL selected at runtime.
 wgpu = { version = "22", features = ["webgl"], optional = true }
+# Async scenario fetch (no std::fs on wasm).
+ehttp = { version = "0.5", optional = true }
 
 [profile.dev]
 opt-level = 1
