@@ -25,8 +25,8 @@ cargo build --release
 
 ### Visualizer — Beamer (`beamer`)
 
-A cinematic, GPU-rendered, interactive 3D visualizer — built into the app
-(wgpu + egui), no browser or external tooling. Run it from the repo root:
+A cinematic, GPU-rendered, interactive 3D globe — built into the app
+(wgpu + egui), with no browser or external tooling. Run it from the repo root:
 
 ```sh
 cargo run --release --bin beamer
@@ -35,36 +35,47 @@ cargo run --release --bin beamer
 It opens **fullscreen**, framed on the United States, on the 100k-user case
 (`11`), and starts playing the assignment immediately. The same **production
 solver** drives it, so the coverage it reports is identical to the CLI
-certificate — `Optimized · ensemble + repair` is the default algorithm (the
-greedy/flow-seeded constructions remain selectable for comparison and show
-*lower* coverage, as expected).
+certificate. `Optimized · ensemble + repair` is the default algorithm; the
+greedy and flow-seeded constructions stay selectable for comparison and show
+*lower* coverage, as expected.
 
-Rendering is **4× MSAA** with a starfield backdrop and beams as clean RGB
-ribbons (A red, B green, C blue, D yellow). The **earth is transparent by
+**Rendering** is 4× MSAA with a starfield backdrop and beams drawn as clean RGB
+ribbons (A red, B green, C blue, D yellow). The earth is **transparent by
 default** — pick a **basemap** (Dark / Light / Satellite) from the Map panel to
-stream a live, level-of-detail globe on demand (nothing is pre-baked; zoom in
-and higher-detail tiles load on background threads, with a Fresnel atmosphere
-halo). You can **scroll all the way through the surface to the planet's core**
-and view the whole beam network from the inside looking out.
+stream a live, level-of-detail globe on demand: nothing is pre-baked, so zooming
+in pulls higher-detail tiles on background threads, wrapped in a Fresnel
+atmosphere halo. You can scroll all the way through the surface to the planet's
+core and watch the whole beam network from the inside out.
 
-The black/white/glass UI is a slim **top-left toolbar** (title + chips that open
-the floating panels + **Hide**, also toggled with `H`), a compact **coverage**
-readout (top-right), and a redesigned **transport** bar (bottom-center: restart,
-play/pause, scrubber, and speed presets). The toolbar chips open four **movable**
-glass cards — **Scene** (scenario + algorithm + rerun), **Bands** (RGB band +
-layer toggles), **Map** (basemap selector), and **Unserved Terminals** (counts
-grouped by *why* each terminal failed — no satellite in view, blocked by an
-interferer, all satellites full, or no free color — with a list you can **click
-to fly the camera to**). Drag any card to reposition it.
+The black/white/glass **HUD** is a slim top-left toolbar (title + chips, plus
+**Hide**), a compact **coverage** readout (top-right), and a **transport** bar
+(bottom-center: restart, play/pause, scrubber, and speed presets). The toolbar
+chips open four **movable** glass cards:
+
+- **Scene** — scenario, algorithm, and rerun.
+- **Bands** — RGB band and per-layer toggles.
+- **Map** — basemap selector.
+- **Unserved Terminals** — counts grouped by *why* each terminal failed (no
+  satellite in view, blocked by an interferer, all satellites full, or no free
+  color), with a list you can **click to fly the camera to**.
 
 Hover any satellite or terminal for a tooltip (id, beams in use, band, or why it
-couldn't be served). Drag to orbit, scroll to zoom (all the way to the core),
-drag any panel to move it. **`H`** hides/shows the HUD, **`F11`** toggles
-fullscreen, **`Esc`** leaves fullscreen.
+couldn't be served).
+
+**Controls**
+
+| Input | Action |
+|---|---|
+| Drag | Orbit |
+| Scroll | Zoom (all the way to the core) |
+| Drag a card | Reposition that panel |
+| `H` | Hide / show the HUD |
+| `F11` | Toggle fullscreen |
+| `Esc` | Leave fullscreen |
 
 Basemaps © OpenStreetMap contributors © CARTO; satellite imagery © Esri.
-(`beamer --shot <scenario> <out.png> [fraction]` renders a single 3-D frame
-headlessly to a PNG.)
+Run `beamer --shot <scenario> <out.png> [fraction]` to render a single 3-D frame
+headlessly to a PNG.
 
 ## Algorithm
 
