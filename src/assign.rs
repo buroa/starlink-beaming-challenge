@@ -23,6 +23,10 @@ const MAX_DEPTH: u32 = 4;
 /// Per-attempt expansion budget — caps the work spent seating one user, keeping
 /// repair strictly bounded (it converges well within this on every test case).
 const ATTEMPT_BUDGET: u32 = 2000;
+/// Per-user budget for the recolor-enabled final repair pass. Smaller than
+/// `ATTEMPT_BUDGET` because recolor fires the costly exact 4-coloring; the chains
+/// it recovers are short, so a tight budget keeps the pass cheap.
+const RECOLOR_BUDGET: u32 = 512;
 /// Hard cap on large-neighborhood-search rounds per worker (a deterministic
 /// iteration bound; the search usually stops earlier via the stall limit).
 const LNS_MAX_ROUNDS: u32 = 1_200;
@@ -34,6 +38,13 @@ const LNS_WORKERS: u32 = 16;
 /// shallow and cheap here (vs. the full-strength constants used once at repair).
 const LNS_DEPTH: u32 = 3;
 const LNS_ATTEMPT_BUDGET: u32 = 256;
+/// Intensive LNS knobs used only by the opt-in `Maximum` algorithm (CLI `--max`):
+/// far more rounds, deeper chains, and a bigger per-attempt budget. These
+/// push a residual-gap component to its practical ceiling (e.g. case 11's hard
+/// component gains ~+5 users) at the cost of seconds — never on the default path.
+const LNS_MAX_ROUNDS_INTENSE: u32 = 40_000;
+const LNS_DEPTH_INTENSE: u32 = 5;
+const LNS_ATTEMPT_BUDGET_INTENSE: u32 = 2_000;
 /// Components no larger than this are eligible for an exact branch-and-bound
 /// certification pass (proves the optimum, lifting that component to a perfect
 /// A/bound). Larger components are out of reach for exact solving.
@@ -159,11 +170,11 @@ impl<'a> CompSolver<'a> {
 
     /// Greedy construction, then repair unless greedy already hit the bound.
     /// Returns the number of users served.
-    fn solve(&mut self, order: &[u32], upper_bound: usize, deadline: Instant) -> usize {
+    fn solve(&mut self, order: &[u32], upper_bound: usize, deadline: Instant, recolor: bool) -> usize {
         self.greedy(order);
         let assigned = self.assigned_count();
         if assigned < upper_bound {
-            self.repair(order, deadline);
+            self.repair(order, deadline, recolor);
             self.assigned_count()
         } else {
             assigned
@@ -270,7 +281,15 @@ impl<'a> CompSolver<'a> {
     /// no-ops, and a successful augment is never unwound, so it is safe);
     /// displacement and re-seat stay on the fast path so the undo never has to
     /// reverse a recolor. Strictly bounded by `self.budget`.
-    fn augment(&mut self, x: u32, depth: u32) -> bool {
+    /// Ejection-chain search to seat user `x`. With `recolor = false` (the hot
+    /// path used by construction repair and LNS) a displaced re-seat stays on the
+    /// O(members) fast color path and the undo is a cheap pop/re-seat. With
+    /// `recolor = true` the displacement may recolor the satellite — so a chain
+    /// succeeds whenever `{s\{m} ∪ x}` is 4-colorable, not merely when a color is
+    /// free under the current labels — and the undo restores an exact snapshot.
+    /// Recolor finds strictly more chains but is far costlier (it fires the exact
+    /// 4-coloring), so it is reserved for a single bounded final pass.
+    fn augment(&mut self, x: u32, depth: u32, recolor: bool) -> bool {
         if depth == 0 || self.budget == 0 {
             return false;
         }
@@ -289,6 +308,12 @@ impl<'a> CompSolver<'a> {
                 return true;
             }
             self.visited[s as usize] = self.gen;
+            // Snapshot is only needed to undo a possible recolor.
+            let snap = if recolor {
+                Some(self.sats[s as usize].clone())
+            } else {
+                None
+            };
             let members: ArrayVec<u32, 32> = self.sats[s as usize].users.clone();
             for m in members {
                 if self.budget == 0 {
@@ -296,24 +321,54 @@ impl<'a> CompSolver<'a> {
                 }
                 self.sats[s as usize].remove(m);
                 self.set_user(m, -1);
-                if self.sats[s as usize].try_insert(x, dx, false) {
+                if self.sats[s as usize].try_insert(x, dx, recolor) {
                     self.set_user(x, s as i32);
-                    if self.augment(m, depth - 1) {
+                    if self.augment(m, depth - 1, recolor) {
                         return true;
                     }
                     self.set_user(x, -1);
-                    self.sats[s as usize].pop(); // remove x
+                    if !recolor {
+                        self.sats[s as usize].pop(); // remove x
+                    }
                 }
-                // Re-seat m (its original color is always free among the rest).
-                let dm = self.dir(m, s);
-                self.sats[s as usize].try_insert(m, dm, false);
+                match &snap {
+                    // Recolor path: restore s exactly (handles any relabel).
+                    Some(snap) => self.sats[s as usize].clone_from(snap),
+                    // Fast path: m's original color is still free among the rest.
+                    None => {
+                        let dm = self.dir(m, s);
+                        self.sats[s as usize].try_insert(m, dm, false);
+                    }
+                }
                 self.set_user(m, s as i32);
             }
         }
         false
     }
 
-    fn repair(&mut self, order: &[u32], deadline: Instant) {
+    /// Final, coloring-complete repair pass over the users still unserved, run
+    /// once on the chosen solution. It allows the displacement to recolor, so it
+    /// seats chains the fast (no-recolor) repair/LNS could not realize under their
+    /// fixed labels — recovering coverage the construction coloring otherwise
+    /// left on the table. Bounded to the residual, so the costly recolor stays
+    /// cheap overall. It only ever adds users.
+    fn recolor_repair(&mut self, order: &[u32], deadline: Instant) {
+        for &x in order {
+            if self.user_sat[x as usize] >= 0 {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            self.gen += 1;
+            self.budget = RECOLOR_BUDGET;
+            self.augment(x, MAX_DEPTH, true);
+        }
+    }
+
+    /// `recolor` lets the displacement recolor (Maximum mode) — strictly more
+    /// chains, far costlier; the default fast path passes `false`.
+    fn repair(&mut self, order: &[u32], deadline: Instant, recolor: bool) {
         for &x in order {
             if self.user_sat[x as usize] >= 0 {
                 continue;
@@ -323,7 +378,7 @@ impl<'a> CompSolver<'a> {
             }
             self.gen += 1;
             self.budget = ATTEMPT_BUDGET;
-            self.augment(x, MAX_DEPTH);
+            self.augment(x, MAX_DEPTH, recolor);
         }
     }
 
@@ -411,6 +466,7 @@ impl<'a> CompSolver<'a> {
         order: &[u32],
         ub: usize,
         deadline: Instant,
+        recolor: bool,
     ) -> usize {
         // Group the matched users by their satellite.
         let mut by_sat: Vec<Vec<u32>> = vec![Vec::new(); self.sats.len()];
@@ -445,7 +501,7 @@ impl<'a> CompSolver<'a> {
         // Repair flow-unmatched and coloring-evicted users.
         let assigned = self.assigned_count();
         if assigned < ub {
-            self.repair(order, deadline);
+            self.repair(order, deadline, recolor);
         }
         self.assigned_count()
     }
@@ -467,7 +523,7 @@ impl<'a> CompSolver<'a> {
     /// — byte-identical regardless of machine speed. The kept solution is never
     /// worse than the input. `deadline` is only a backstop on pathological
     /// machines (never reached on the test set).
-    fn lns(&mut self, ub: usize, deadline: Instant, seed: u64) {
+    fn lns(&mut self, ub: usize, deadline: Instant, seed: u64, intense: bool) {
         let nusers = self.user_sat.len() as u32;
         if nusers == 0 {
             return;
@@ -476,9 +532,15 @@ impl<'a> CompSolver<'a> {
         // `stall` ends a converged search early — gains plateau quickly, so a
         // short stall window captures almost all of them cheaply. Each round is
         // O(touched) thanks to the transactional undo, so the bound can be
-        // generous without hurting wall-clock.
-        let max_rounds = (self.user_sat.len() as u32 * 4).min(LNS_MAX_ROUNDS);
-        let stall_limit = (max_rounds / 4).clamp(800, 4000);
+        // generous without hurting wall-clock. `intense` (the Maximum algorithm)
+        // lifts the ceilings to chase the last few users on a residual-gap component.
+        let (rounds_cap, depth, attempt_budget) = if intense {
+            (LNS_MAX_ROUNDS_INTENSE, LNS_DEPTH_INTENSE, LNS_ATTEMPT_BUDGET_INTENSE)
+        } else {
+            (LNS_MAX_ROUNDS, LNS_DEPTH, LNS_ATTEMPT_BUDGET)
+        };
+        let max_rounds = (self.user_sat.len() as u32 * 4).min(rounds_cap);
+        let stall_limit = (max_rounds / 4).clamp(800, if intense { 8_000 } else { 4_000 });
         let mut best_cnt = self.assigned_count();
         // A fixed LCG seeded by component shape *and the worker seed* — each
         // parallel search explores a different sequence of ruins, but every run
@@ -547,8 +609,8 @@ impl<'a> CompSolver<'a> {
                     continue;
                 }
                 self.gen += 1;
-                self.budget = LNS_ATTEMPT_BUDGET;
-                self.augment(u, LNS_DEPTH);
+                self.budget = attempt_budget;
+                self.augment(u, depth, false);
             }
 
             let seated = freed
@@ -658,6 +720,7 @@ fn solve_component(
     feas_sats: &[Vec<u32>],
     c: &Component,
     deadline: Instant,
+    intense: bool,
 ) -> CompResult {
     let ns = c.sats.len();
     // Local feasibility: every feasible sat of a component user is in this
@@ -696,84 +759,99 @@ fn solve_component(
             .then(pa.z.total_cmp(&pb.z))
     });
 
-    // Ensemble of independent greedy constructions; no single sat-ordering wins
-    // every component, so we keep the best. They don't interact, so they run in
-    // parallel — which also shortens the largest component's critical path.
-    //   0: least-loaded sats        1: highest-elevation sats
-    //   2: least-contended sats     3: spatial user order + highest elevation
-    let mut runs: Vec<(usize, CompSolver)> = (0u32..4)
-        .into_par_iter()
-        .map(|cfg| {
-            let (sat_choice, ord) = match cfg {
-                1 => (SatChoice::HighestElevation, &order),
-                2 => (SatChoice::LeastContended, &order),
-                3 => (SatChoice::HighestElevation, &order_pos),
-                _ => (SatChoice::LeastLoaded, &order),
-            };
-            let mut solver = CompSolver::new(scn, c, &local_feas, &sat_deg, sat_choice);
-            let ach = solver.solve(ord, upper_bound, deadline);
-            (ach, solver)
-        })
-        .collect();
-    // Best greedy; ties resolve to the lowest member index (deterministic).
-    let mut best_idx = 0;
-    for i in 1..runs.len() {
-        if runs[i].0 > runs[best_idx].0 {
-            best_idx = i;
-        }
-    }
-    let best_greedy_ach = runs[best_idx].0;
-
-    // Flow-seeded construction: realize the optimal max-flow matching, then
-    // repair. Its only edge over greedy is recovering capacity that greedy left
-    // on the table, so it cannot help once greedy already reaches the matching
-    // upper bound — and its repair over a flow-saturated graph is by far the
-    // costliest construction. So run it only when greedy fell short; on the
-    // capacity-bound mega-components (already at the bound) we skip it entirely.
-    // When it does run it wins ties, matching the canonical capacity-optimal
-    // layout.
-    let (best_seed_ach, seed_solver) = if best_greedy_ach < upper_bound {
-        let mut fs = CompSolver::new(scn, c, &local_feas, &sat_deg, SatChoice::LeastLoaded);
-        let fs_ach = fs.seed_and_repair(&matching, &order, upper_bound, deadline);
-        if fs_ach >= best_greedy_ach {
-            (fs_ach, fs)
-        } else {
-            runs.swap_remove(best_idx)
-        }
-    } else {
-        runs.swap_remove(best_idx)
-    };
-
-    // Polish with large-neighborhood search. The LNS of a single component is
-    // serial, so the giant component would pin one core while the rest idle —
-    // instead launch many *independent* searches (different ruin sequences) in
-    // parallel and keep the best. Work-stealing fills the cores freed by the
-    // small components, so the whole machine drives the hard component. A fixed
-    // worker count keeps the result independent of the core count.
-    let best_solver = if best_seed_ach < upper_bound {
-        // `collect` preserves worker order, so the pick (max served, ties to the
-        // lowest worker index) is byte-deterministic regardless of scheduling.
-        let mut polished: Vec<CompSolver> = (0..LNS_WORKERS)
+    // One full construct → flow-seed → LNS → (Maximum) recolor pipeline, for a
+    // given construction `recolor` mode. Factored so Maximum mode can run it BOTH
+    // ways and keep the per-component best: recolor-during-construction recovers a
+    // user on some components (09/10) but costs users on others (11), and neither
+    // mode wins everywhere — so the only way to the true maximum is to try both.
+    let run_pipeline = |recolor: bool| -> CompSolver {
+        // Ensemble of independent greedy constructions; keep the best. They don't
+        // interact, so they run in parallel.
+        //   0: least-loaded sats        1: highest-elevation sats
+        //   2: least-contended sats     3: spatial user order + highest elevation
+        let mut runs: Vec<(usize, CompSolver)> = (0u32..4)
             .into_par_iter()
-            .map(|w| {
-                let mut s = seed_solver.clone();
-                s.lns(upper_bound, deadline, w as u64);
-                s
+            .map(|cfg| {
+                let (sat_choice, ord) = match cfg {
+                    1 => (SatChoice::HighestElevation, &order),
+                    2 => (SatChoice::LeastContended, &order),
+                    3 => (SatChoice::HighestElevation, &order_pos),
+                    _ => (SatChoice::LeastLoaded, &order),
+                };
+                let mut solver = CompSolver::new(scn, c, &local_feas, &sat_deg, sat_choice);
+                let ach = solver.solve(ord, upper_bound, deadline, recolor);
+                (ach, solver)
             })
             .collect();
-        let mut bi = 0;
-        let mut bc = polished[0].assigned_count();
-        for (i, p) in polished.iter().enumerate().skip(1) {
-            let c = p.assigned_count();
-            if c > bc {
-                bc = c;
-                bi = i;
+        // Best greedy; ties resolve to the lowest member index (deterministic).
+        let mut best_idx = 0;
+        for i in 1..runs.len() {
+            if runs[i].0 > runs[best_idx].0 {
+                best_idx = i;
             }
         }
-        polished.swap_remove(bi)
-    } else {
-        seed_solver // already provably optimal for this component
+        let best_greedy_ach = runs[best_idx].0;
+
+        // Flow-seeded construction (realize the optimal matching, then repair),
+        // run only when greedy fell short of the bound; it wins ties.
+        let (best_seed_ach, seed_solver) = if best_greedy_ach < upper_bound {
+            let mut fs = CompSolver::new(scn, c, &local_feas, &sat_deg, SatChoice::LeastLoaded);
+            let fs_ach = fs.seed_and_repair(&matching, &order, upper_bound, deadline, recolor);
+            if fs_ach >= best_greedy_ach {
+                (fs_ach, fs)
+            } else {
+                runs.swap_remove(best_idx)
+            }
+        } else {
+            runs.swap_remove(best_idx)
+        };
+
+        // Polish with parallel ruin-and-recreate LNS (intensive under `intense`),
+        // keeping the best worker. Components at their bound exit LNS immediately.
+        let mut best_solver = if best_seed_ach < upper_bound {
+            let mut polished: Vec<CompSolver> = (0..LNS_WORKERS)
+                .into_par_iter()
+                .map(|w| {
+                    let mut s = seed_solver.clone();
+                    s.lns(upper_bound, deadline, w as u64, intense);
+                    s
+                })
+                .collect();
+            let mut bi = 0;
+            let mut bc = polished[0].assigned_count();
+            for (i, p) in polished.iter().enumerate().skip(1) {
+                let cnt = p.assigned_count();
+                if cnt > bc {
+                    bc = cnt;
+                    bi = i;
+                }
+            }
+            polished.swap_remove(bi)
+        } else {
+            seed_solver // already provably optimal for this component
+        };
+
+        // Maximum mode only: one coloring-complete pass over the residual.
+        if intense && best_solver.assigned_count() < upper_bound {
+            best_solver.recolor_repair(&order, deadline);
+        }
+        best_solver
     };
+
+    // Default: a single pass (no construction recolor). Maximum: run both
+    // construction modes and keep whichever serves more on this component.
+    let best_solver = if intense {
+        let plain = run_pipeline(false);
+        let recolored = run_pipeline(true);
+        if recolored.assigned_count() > plain.assigned_count() {
+            recolored
+        } else {
+            plain
+        }
+    } else {
+        run_pipeline(false)
+    };
+
     let mut best_ach = best_solver.assigned_count();
     let mut best = best_solver.sats;
 
@@ -822,8 +900,12 @@ fn solve_component(
         if sat.users.is_empty() {
             continue;
         }
+        // Level the four color bands per satellite — a cosmetic, coverage-neutral
+        // relabel of this satellite's final beams (first-fit otherwise piles onto
+        // color 0, which dominates every render).
+        let balanced = crate::coloring::rebalance(&sat.dirs, &sat.colors, c.sats[ls] as usize);
         let members: Vec<(u32, u8)> = (0..sat.users.len())
-            .map(|i| (c.users[sat.users[i] as usize], sat.colors[i]))
+            .map(|i| (c.users[sat.users[i] as usize], balanced[i]))
             .collect();
         sat_members.push((c.sats[ls], members));
     }
@@ -847,17 +929,22 @@ pub struct Solution {
     pub colored_bound: usize,
 }
 
+/// Solve the scenario. `intense` selects the maximum-coverage mode (the
+/// `Maximum` algorithm / CLI `--max`): a much larger LNS budget on residual-gap
+/// components, slower but recovering the last few users. The default (`false`)
+/// is the standard ~sub-second production solve.
 pub fn solve(
     scn: &Scenario,
     feas: &crate::feasibility::Feasibility,
     deadline: Instant,
+    intense: bool,
 ) -> Solution {
     let comps = components::decompose(feas, scn.sats.len());
 
     // Each component is fully independent → solve them in parallel.
     let results: Vec<CompResult> = comps
         .par_iter()
-        .map(|c| solve_component(scn, &feas.sats, c, deadline))
+        .map(|c| solve_component(scn, &feas.sats, c, deadline, intense))
         .collect();
 
     let mut per_sat = vec![Vec::new(); scn.sats.len()];

@@ -38,6 +38,10 @@ cargo build --release
 # Solve one scenario; the solution (+ a certificate header) goes to stdout.
 ./target/release/beam-planner test_cases/09_ten_thousand_users.txt
 
+# Maximum-coverage mode: spend seconds of intensive search to recover the last
+# few users on the hardest component (default is the ~sub-second solve).
+./target/release/beam-planner test_cases/11_one_hundred_thousand_users.txt --max
+
 # Solve and validate every test case through the official evaluate.py.
 ./run.sh
 ```
@@ -123,6 +127,18 @@ color-symmetry breaking, and a K5 clique cutoff cut its work by ~16× — and th
 whole 100k case by ~30× — versus the first correct version, with no loss of
 coverage. The polish is a single speed↔quality knob (`LNS_MAX_ROUNDS`).
 
+The opt-in **`Maximum`** algorithm (CLI `--max`, or the visualizer's algorithm
+picker) chases the last few users on any component that still has a gap: a much
+larger LNS budget, *both* construction colorings (kept best per component, since
+recoloring during construction helps some components and hurts others), and a
+coloring-complete repair pass. It recovers **+1 user each on cases 09 and 10 and
++6 on the 100k case** (29,446 → 29,452), taking ~10 s on the 100k case. That an
+exhaustive search recovers only ~8 users total — against a residual gap-to-bound
+of ~400 — is the evidence that that gap is a **global coloring coupling** the
+(loose) matching/clique bound can't see, not unserved-but-servable users. The
+default solve is already at the practical optimum; `Maximum` just proves it the
+expensive way.
+
 ## Visualizer — Beamer
 
 `beamer` is a GPU-rendered, interactive 3D globe built straight into the app
@@ -136,29 +152,46 @@ It opens fullscreen, framed on the United States, on the 100k-user case (`11`),
 and plays the assignment immediately. The **same production solver** drives it,
 so its coverage matches the CLI certificate exactly; `Optimized · ensemble +
 repair` is the default algorithm, with the greedy and flow-seeded constructions
-selectable for comparison (they report *lower* coverage, as expected).
+selectable for comparison (they report *lower* coverage, as expected) and a
+`Maximum · intensive search` mode that trades seconds for the last few users
+(the CLI equivalent is `--max`).
 
 Rendering is 4× MSAA with a starfield backdrop and beams as RGB ribbons
 (A red, B green, C blue, D yellow). The earth is **transparent by default** —
-pick a **basemap** (Dark / Light / Satellite) from the Map panel to stream a
-live, level-of-detail globe: nothing is pre-baked, so zooming in pulls
-higher-detail tiles on background threads behind a Fresnel atmosphere halo.
-Scroll all the way through the surface to the core and watch the network from the
-inside out.
+pick a **basemap** (Dark / Light / Satellite) to stream a live, level-of-detail
+globe: nothing is pre-baked, so zooming in pulls higher-detail tiles on
+background threads. The **Fresnel atmosphere halo** is a separate toggle, so its
+blue glow can ride over the transparent earth with no basemap at all. Scroll all
+the way through the surface to the core and watch the network from the inside out.
 
-The black/white/glass HUD is a top-left toolbar (chips + **Hide**), a coverage
-readout (top-right), and a transport bar (restart, play/pause, scrubber, speed
-presets). The toolbar chips open four movable glass cards:
+The black/white/glass HUD is one left-hand control column plus three fixed
+readouts; `H` hides all of it:
 
-- **Scene** — scenario, algorithm, rerun.
-- **Bands** — RGB band and per-layer toggles.
-- **Map** — basemap selector.
-- **Unserved Terminals** — counts grouped by *why* each terminal failed (no
-  satellite in view, blocked by an interferer, all satellites full, or no free
-  color), with a list you can **click to fly the camera to**.
+- **Left column** — scenario and algorithm pickers, color-band toggles, scene
+  **Layers** (beams, full/partial satellites, uncovered terminals, and
+  **interferers**), and the **Basemap** selector with its independent
+  **Atmosphere halo** toggle.
+- **Coverage** (top-right) — live served / total and percent-of-optimum.
+- **Transport** (bottom-center) — restart, play/pause, scrubber, speed presets.
+- **Unserved Terminals** (bottom-right) — counts grouped by *why* each terminal
+  failed (no satellite in view, blocked by an interferer, all satellites full, or
+  no free color), with a list you can **click to fly the camera to**.
 
-Hover any satellite or terminal for a tooltip (id, beams in use, band, or the
-reason it went unserved).
+Toggle **Interferers** to plot the non-Starlink satellites; hover one to light up
+its **20° field of interference** as a footprint ring on the globe directly
+beneath it. Hover any satellite, terminal, or interferer for a tooltip (id, beams
+in use, band, or why it went unserved) — and a served terminal's tooltip takes a
+faint tint of its assigned band color.
+
+**Satellite focus.** Click any satellite to drop into a cinematic study of just
+that one: the camera flies in, everything else falls away, and the satellite gets
+a pulsing lock-on **reticle** with its beam fan to the users it serves (colored by
+band) and the nearest interferer's 20° field. A focus card replaces the global
+readouts with the satellite's identity, a **beams X / 32** gauge, the per-band
+**A/B/C/D** breakdown, interferer proximity, and a scoped **replay** scrubber that
+renders out just this satellite's assignment. Change the algorithm while focused
+to watch the change for that one satellite in isolation. Click another satellite
+to switch, or `Esc` / click empty space to exit.
 
 **Controls**
 
@@ -166,10 +199,10 @@ reason it went unserved).
 |---|---|
 | Drag | Orbit |
 | Scroll | Zoom (all the way to the core) |
-| Drag a card | Reposition that panel |
+| Click a satellite | Focus it (Esc / click away to exit) |
 | `H` | Hide / show the HUD |
 | `F11` | Toggle fullscreen |
-| `Esc` | Leave fullscreen |
+| `Esc` | Leave focus, then fullscreen |
 
 Two headless modes render without a window: `beamer --shot <scenario> <out.png>
 [fraction]` writes a single frame to a PNG, and `beamer --frames <scenario>

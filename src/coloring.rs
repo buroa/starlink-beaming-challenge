@@ -16,12 +16,13 @@ use crate::geom::{same_color_conflict, Vec3};
 /// working arrays to this lets the exact coloring run with zero heap allocation.
 const MAX_M: usize = 33;
 
-/// Find a color in 0..4 for `cand_dir` given existing members `dirs`/`colors`
-/// (parallel arrays of equal length). On success via the exact path, existing
-/// members may be recolored in place; the returned color is the candidate's.
-/// Returns `None` iff {members ∪ candidate} is not 4-colorable.
-/// Fast path only: the lowest color none of whose members conflict with the
-/// candidate, or `None` if all four are blocked. O(members); never recolors.
+/// Fast path: the lowest color none of whose members conflict with the candidate,
+/// or `None` if all four are blocked. O(members); never recolors.
+///
+/// This stays first-fit on purpose: it is the coverage-defining hot path (its
+/// accept/reject feeds construction, repair, and LNS), so it must be cheap and
+/// stable. The resulting first-fit skew (color 0 dominates) is corrected purely
+/// cosmetically, after the assignment is final, by [`rebalance`].
 #[inline]
 pub fn fast_color(dirs: &[Vec3], colors: &[u8], cand_dir: Vec3) -> Option<u8> {
     let n = dirs.len();
@@ -180,6 +181,84 @@ fn color_search(
         assign[best] = u8::MAX;
     }
     false
+}
+
+/// Cosmetic, coverage-neutral rebalancing of one satellite's final beams.
+///
+/// `dirs`/`colors` are a satellite's served beams and their (first-fit, color-0
+/// heavy) coloring. This returns a *new* proper 4-coloring of the same beams that
+/// levels the four color classes as far as the <10° conflicts allow — DSATUR order
+/// (most-saturated beam first) with a least-loaded color choice. It only relabels
+/// an already-fixed set, so coverage is untouched; if the heuristic ever gets
+/// stuck (a 4-colorable graph can defeat a greedy order) it returns the original
+/// coloring unchanged, so the result is always valid.
+///
+/// `phase` (e.g. the satellite's id) rotates the tie-break among equally-loaded
+/// colors, so each satellite's first beam doesn't always land on color 0 —
+/// without it, the swarm of low-load satellites re-skews the global mix toward
+/// red. It only affects ties, so coverage and per-satellite balance are unchanged.
+pub fn rebalance(dirs: &[Vec3], colors: &[u8], phase: usize) -> Vec<u8> {
+    let n = dirs.len();
+    if n <= 1 {
+        // Even a lone beam rotates, so single-beam satellites span all four bands.
+        return vec![(phase % 4) as u8; n];
+    }
+    // Conflict adjacency (same-satellite beams within 10°) + degrees. n ≤ 32, so a
+    // 64-bit neighbour bitset per beam is ample.
+    let mut adj = vec![0u64; n];
+    let mut deg = vec![0u32; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if same_color_conflict(dirs[i], dirs[j]) {
+                adj[i] |= 1 << j;
+                adj[j] |= 1 << i;
+                deg[i] += 1;
+                deg[j] += 1;
+            }
+        }
+    }
+
+    let mut out = vec![u8::MAX; n];
+    let mut class = [0u32; 4]; // current size of each color class
+    for _ in 0..n {
+        // DSATUR: color the uncolored beam whose neighbours already use the most
+        // distinct colors (tie → highest degree → lowest index).
+        let mut best = usize::MAX;
+        let (mut best_sat, mut best_deg, mut best_used) = (0u32, 0u32, 0u8);
+        for v in 0..n {
+            if out[v] != u8::MAX {
+                continue;
+            }
+            let mut used = 0u8;
+            let mut nb = adj[v];
+            while nb != 0 {
+                let u = nb.trailing_zeros() as usize;
+                nb &= nb - 1;
+                if out[u] != u8::MAX {
+                    used |= 1 << out[u];
+                }
+            }
+            let sat = used.count_ones();
+            if best == usize::MAX || sat > best_sat || (sat == best_sat && deg[v] > best_deg) {
+                best = v;
+                best_sat = sat;
+                best_deg = deg[v];
+                best_used = used;
+            }
+        }
+        match (0..4u8)
+            .filter(|&c| best_used & (1 << c) == 0)
+            .min_by_key(|&c| (class[c as usize], (c as usize + phase) % 4))
+        {
+            Some(c) => {
+                out[best] = c;
+                class[c as usize] += 1;
+            }
+            // Defeated greedily — keep the known-valid input coloring for this sat.
+            None => return colors.to_vec(),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use std::io::{self, BufWriter, Write};
 pub struct Scenario {
     pub sat_ids: Vec<String>,
     pub user_ids: Vec<String>,
+    pub interferer_ids: Vec<String>,
     pub sats: Vec<Vec3>,
     pub users: Vec<Vec3>,
     pub interferers: Vec<Vec3>,
@@ -18,6 +19,7 @@ impl Scenario {
         let mut s = Scenario {
             sat_ids: Vec::new(),
             user_ids: Vec::new(),
+            interferer_ids: Vec::new(),
             sats: Vec::new(),
             users: Vec::new(),
             interferers: Vec::new(),
@@ -50,7 +52,10 @@ impl Scenario {
                     s.user_ids.push(id.to_string());
                     s.users.push(pos(&coords)?);
                 }
-                ("interferer", Some(_)) => s.interferers.push(pos(&coords)?),
+                ("interferer", Some(id)) => {
+                    s.interferer_ids.push(id.to_string());
+                    s.interferers.push(pos(&coords)?);
+                }
                 _ => return Err(format!("unrecognized line: {line}")),
             }
         }

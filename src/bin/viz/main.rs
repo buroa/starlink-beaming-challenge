@@ -60,6 +60,8 @@ struct Loaded {
     feas: feasibility::Feasibility,
     user_pos: Vec<Vec3>,
     sat_pos: Vec<Vec3>,
+    /// Non-Starlink interferer satellites (ECEF, f32 for the GPU).
+    interferer_pos: Vec<Vec3>,
     trace: Trace,
     /// Reason counts, in the order of `Reason` variants used below.
     reason_counts: [usize; 4],
@@ -71,7 +73,31 @@ struct ViewOpts {
     show_empty: bool,
     show_uncovered: bool,
     show_beams: bool,
+    show_interferers: bool,
 }
+
+/// What the cursor is over, resolved once per frame and reused for both the
+/// tooltip and (for an interferer) its field-of-interference overlay.
+struct Hover {
+    title: String,
+    lines: Vec<String>,
+    /// Assigned band (0..3) of a served terminal — tints the tooltip.
+    band: Option<u8>,
+    /// Index of a hovered interferer — draws its 20° field.
+    interferer: Option<usize>,
+}
+
+/// The scene entity under the cursor, resolved by [`App::pick`].
+#[derive(Clone, Copy, PartialEq)]
+enum Picked {
+    Sat(usize),
+    User(usize),
+    Interferer(usize),
+}
+
+/// An interferer counts as "around" a focused satellite when their geocentric
+/// directions are within this angle — i.e. they share the same patch of sky.
+const FOCUS_INTERFERER_COS: f32 = 0.906_307_8; // cos(25°)
 
 /// Build the GPU point + beam lists for the first `revealed_f` beams. Shared by
 /// the live UI and the headless screenshot.
@@ -83,6 +109,7 @@ fn compose(
     revealed_f: f64,
     o: &ViewOpts,
     selected: Option<usize>,
+    hover_interferer: Option<usize>,
 ) -> (Vec<PointInstance>, Vec<BeamInstance>) {
     let revealed = (revealed_f as usize).min(l.trace.events.len());
     let events = &l.trace.events[..revealed];
@@ -187,7 +214,203 @@ fn compose(
         }
     }
 
+    // Interferers (non-Starlink satellites) as distinct markers, plus the 20°
+    // field of interference for whichever one the cursor is over.
+    if o.show_interferers {
+        for ip in &l.interferer_pos {
+            points.push(PointInstance {
+                pos: ip.to_array(),
+                size: 9.0,
+                color: INTERFERER_RGBA,
+            });
+        }
+        if let Some(hi) = hover_interferer {
+            if let Some(&ip) = l.interferer_pos.get(hi) {
+                push_interference_field(&mut points, &mut beams, ip);
+            }
+        }
+    }
+
     (points, beams)
+}
+
+/// Magenta, distinct from the four band colors and the satellite-status palette.
+const INTERFERER_RGBA: [f32; 4] = [0.85, 0.35, 1.0, 0.95];
+/// The same magenta as readable UI text (for interferer labels/warnings).
+const INTERFERER_UI: egui::Color32 = egui::Color32::from_rgb(217, 140, 255);
+
+/// Draw one interferer's 20° field of interference as a "bullseye" footprint on
+/// the globe directly beneath it — a bold ring at 20° geocentric radius around
+/// the sub-interferer point, filled with sparse radial spokes — plus an axis
+/// line running out to the interferer marker itself. (The 20° rule is
+/// observer-relative; this footprint is the clean, legible proxy for the region
+/// the interferer sterilizes, drawn on the surface where it reads clearly rather
+/// than buried inside the globe.)
+fn push_interference_field(points: &mut Vec<PointInstance>, beams: &mut Vec<BeamInstance>, ip: Vec3) {
+    const R: f32 = 6371.0 * 1.004; // just above the Earth's surface
+    let axis = ip.normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return;
+    }
+    // Orthonormal basis spanning the plane perpendicular to the axis.
+    let seed = if axis.z.abs() < 0.95 { Vec3::Z } else { Vec3::X };
+    let u = axis.cross(seed).normalize();
+    let v = axis.cross(u);
+    let (sin20, cos20) = 20f32.to_radians().sin_cos();
+    let purple = |a: f32| [INTERFERER_RGBA[0], INTERFERER_RGBA[1], INTERFERER_RGBA[2], a];
+
+    let sub = axis * R; // sub-interferer point on the surface
+    // Axis line out to the interferer, and a marker at the footprint centre.
+    beams.push(BeamInstance {
+        a: sub.to_array(),
+        b: ip.to_array(),
+        color: purple(0.5),
+    });
+    points.push(PointInstance {
+        pos: sub.to_array(),
+        size: 11.0,
+        color: purple(0.95),
+    });
+
+    const N: usize = 64;
+    let mut prev: Option<[f32; 3]> = None;
+    for k in 0..=N {
+        let t = k as f32 / N as f32 * std::f32::consts::TAU;
+        let dir = cos20 * axis + sin20 * (t.cos() * u + t.sin() * v);
+        let rim = (dir * R).to_array();
+        // Sparse spokes from the centre fill the footprint disc.
+        if k % 4 == 0 {
+            beams.push(BeamInstance {
+                a: sub.to_array(),
+                b: rim,
+                color: purple(0.18),
+            });
+        }
+        // The bold exclusion ring.
+        if let Some(p) = prev {
+            beams.push(BeamInstance {
+                a: p,
+                b: rim,
+                color: purple(0.7),
+            });
+        }
+        prev = Some(rim);
+    }
+}
+
+/// Satellite focus mode: an isolated study of one satellite. Draws only that
+/// satellite (a bright core inside a pulsing camera-facing reticle), the users
+/// it serves up to `reveal` beams (colored by band, with their beams), and any
+/// interferer sharing its patch of sky (marker + 20° field). Everything else in
+/// the constellation is omitted — the globe + atmosphere remain as backdrop.
+fn compose_focus(
+    l: &Loaded,
+    s: usize,
+    reveal: f64,
+    t: f32,
+    eye: Vec3,
+) -> (Vec<PointInstance>, Vec<BeamInstance>) {
+    let mut points = Vec::with_capacity(64);
+    let mut beams = Vec::with_capacity(64);
+    let satpos = l.sat_pos[s];
+
+    // This satellite's beams in assignment order, up to the scoped reveal.
+    let mut shown = 0usize;
+    for e in &l.trace.events {
+        if e.sat as usize != s {
+            continue;
+        }
+        if (shown as f64) >= reveal {
+            break;
+        }
+        shown += 1;
+        let rgb = band_rgb(e.color);
+        let upos = (l.user_pos[e.user as usize] * 1.002).to_array();
+        beams.push(BeamInstance {
+            a: satpos.to_array(),
+            b: upos,
+            color: [rgb[0], rgb[1], rgb[2], 0.85],
+        });
+        points.push(PointInstance {
+            pos: upos,
+            size: 7.5,
+            color: [rgb[0], rgb[1], rgb[2], 1.0],
+        });
+    }
+
+    // The focused satellite: a bright core wrapped in a pulsing reticle.
+    points.push(PointInstance {
+        pos: satpos.to_array(),
+        size: 20.0,
+        color: [0.80, 0.95, 1.0, 1.0],
+    });
+    push_reticle(&mut points, &mut beams, satpos, eye, t);
+
+    // The nearest interferer sharing this satellite's patch of sky: marker + 20°
+    // field. (Drawing only the closest keeps the footprint legible — a belt of
+    // GEO interferers would otherwise stack into overlapping rings.)
+    let sat_dir = satpos.normalize_or_zero();
+    let nearest = l
+        .interferer_pos
+        .iter()
+        .map(|ip| (ip.normalize_or_zero().dot(sat_dir), *ip))
+        .filter(|(d, _)| *d > FOCUS_INTERFERER_COS)
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, ip)) = nearest {
+        points.push(PointInstance {
+            pos: ip.to_array(),
+            size: 9.0,
+            color: INTERFERER_RGBA,
+        });
+        push_interference_field(&mut points, &mut beams, ip);
+    }
+
+    (points, beams)
+}
+
+/// A camera-facing "lock-on" reticle around a focused satellite: a pulsing outer
+/// ring, a steady inner ring, and four crosshair ticks. Pure eye-candy (cyan),
+/// animated by `t`.
+fn push_reticle(points: &mut Vec<PointInstance>, beams: &mut Vec<BeamInstance>, center: Vec3, eye: Vec3, t: f32) {
+    let normal = (eye - center).normalize_or_zero();
+    if normal == Vec3::ZERO {
+        return;
+    }
+    let seed = if normal.z.abs() < 0.95 { Vec3::Z } else { Vec3::X };
+    let u = normal.cross(seed).normalize();
+    let v = normal.cross(u);
+    let cyan = |a: f32| [0.45, 0.9, 1.0, a];
+    let pulse = 0.5 + 0.5 * (t * 2.2).sin(); // 0..1
+    let ring = |beams: &mut Vec<BeamInstance>, r: f32, a: f32| {
+        const N: usize = 48;
+        let mut prev: Option<[f32; 3]> = None;
+        for k in 0..=N {
+            let th = k as f32 / N as f32 * std::f32::consts::TAU;
+            let p = (center + r * (th.cos() * u + th.sin() * v)).to_array();
+            if let Some(pp) = prev {
+                beams.push(BeamInstance { a: pp, b: p, color: cyan(a) });
+            }
+            prev = Some(p);
+        }
+    };
+    // Pulsing outer ring + steady inner ring.
+    ring(beams, 230.0 + 90.0 * pulse, 0.45 + 0.45 * pulse);
+    ring(beams, 150.0, 0.8);
+    // Four crosshair ticks just outside the inner ring, each capped with a node.
+    for k in 0..4 {
+        let th = k as f32 * std::f32::consts::FRAC_PI_2;
+        let dir = th.cos() * u + th.sin() * v;
+        beams.push(BeamInstance {
+            a: (center + 165.0 * dir).to_array(),
+            b: (center + 205.0 * dir).to_array(),
+            color: cyan(0.7),
+        });
+        points.push(PointInstance {
+            pos: (center + 205.0 * dir).to_array(),
+            size: 4.5,
+            color: cyan(0.9),
+        });
+    }
 }
 
 struct App {
@@ -217,15 +440,27 @@ struct App {
     show_empty: bool,
     show_uncovered: bool,
     show_beams: bool,
+    show_interferers: bool,
     bands: [bool; 4],
 
     tile_source: tiles::TileSource,
+    /// Fresnel atmosphere halo, toggleable independently of the basemap.
+    show_atmosphere: bool,
     /// Window fullscreen state (opens fullscreen; F11 toggles, Esc exits).
     fullscreen: bool,
     /// Master HUD visibility (toggle with `H`).
     show_ui: bool,
 
     selected: Option<usize>, // index into trace.unassigned
+
+    /// Satellite focus mode: isolate one satellite, its users, and any nearby
+    /// interferer. `None` = normal whole-constellation view.
+    focused_sat: Option<usize>,
+    /// Scoped playback for the focused satellite's own beams (count revealed);
+    /// `f64::INFINITY` shows the full assignment.
+    focus_reveal: f64,
+    focus_playing: bool,
+
     time: f32,
     anim: Option<CamAnim>,
 }
@@ -278,11 +513,16 @@ impl App {
             show_empty: true,
             show_uncovered: true,
             show_beams: true,
+            show_interferers: false,
             bands: [true; 4],
             tile_source: tiles::TileSource::Off,
+            show_atmosphere: true,
             fullscreen: true,
             show_ui: true,
             selected: None,
+            focused_sat: None,
+            focus_reveal: f64::INFINITY,
+            focus_playing: false,
             time: 0.0,
             anim: None,
         };
@@ -343,16 +583,9 @@ impl App {
 
     /// Hit-test satellites/terminals under the cursor (front hemisphere only),
     /// returning a tooltip title + detail lines.
-    fn hover_entity(
-        &self,
-        ptr: egui::Pos2,
-        rect: egui::Rect,
-        vp: glam::Mat4,
-    ) -> Option<(String, Vec<String>)> {
-        enum H {
-            Sat(usize),
-            User(usize),
-        }
+    /// Hit-test the scene entity under the cursor (front hemisphere only, when
+    /// outside the globe). Shared by the hover tooltip and click-to-focus.
+    fn pick(&self, ptr: egui::Pos2, rect: egui::Rect, vp: glam::Mat4) -> Option<Picked> {
         let l = self.loaded.as_ref()?;
         let eye = self.camera.eye();
         // Horizon-cull only from outside the globe; inside (core view) every
@@ -370,7 +603,7 @@ impl App {
                 rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height(),
             ))
         };
-        let mut best: Option<(f32, H)> = None;
+        let mut best: Option<(f32, Picked)> = None;
         for (i, sp) in l.sat_pos.iter().enumerate() {
             if outside && sp.normalize().dot(eye_n) < horizon - 0.2 {
                 continue;
@@ -378,7 +611,7 @@ impl App {
             if let Some(s) = project(*sp) {
                 let dd = s.distance(ptr);
                 if dd < 13.0 && best.as_ref().is_none_or(|(b, _)| dd < *b) {
-                    best = Some((dd, H::Sat(i)));
+                    best = Some((dd, Picked::Sat(i)));
                 }
             }
         }
@@ -390,34 +623,60 @@ impl App {
             if let Some(s) = project(*up) {
                 let dd = s.distance(ptr);
                 if dd < USER_THRESHOLD && best.as_ref().is_none_or(|(b, _)| dd < *b) {
-                    best = Some((dd, H::User(i)));
+                    best = Some((dd, Picked::User(i)));
                 }
             }
         }
+        // Interferers (only when shown). Cull the far hemisphere like satellites,
+        // so an interferer hidden behind an opaque globe isn't pickable through it.
+        if self.show_interferers {
+            for (i, ip) in l.interferer_pos.iter().enumerate() {
+                if outside && ip.normalize().dot(eye_n) < horizon - 0.2 {
+                    continue;
+                }
+                if let Some(s) = project(*ip) {
+                    let dd = s.distance(ptr);
+                    if dd < 13.0 && best.as_ref().is_none_or(|(b, _)| dd < *b) {
+                        best = Some((dd, Picked::Interferer(i)));
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// Tooltip (title, detail lines, band tint, interferer index) for the entity
+    /// under the cursor.
+    fn hover_entity(&self, ptr: egui::Pos2, rect: egui::Rect, vp: glam::Mat4) -> Option<Hover> {
+        let l = self.loaded.as_ref()?;
         let revealed = (self.revealed as usize).min(l.trace.events.len());
-        match best?.1 {
-            H::Sat(i) => {
+        match self.pick(ptr, rect, vp)? {
+            Picked::Sat(i) => {
                 let load = l.trace.events[..revealed]
                     .iter()
                     .filter(|e| e.sat as usize == i)
                     .count();
-                Some((
-                    format!("Satellite {}", l.scn.sat_ids[i]),
-                    vec![format!("{load} / 32 beams in use")],
-                ))
+                Some(Hover {
+                    title: format!("Satellite {}", l.scn.sat_ids[i]),
+                    lines: vec![format!("{load} / 32 beams in use"), "click to focus →".into()],
+                    band: None,
+                    interferer: None,
+                })
             }
-            H::User(i) => {
+            Picked::User(i) => {
                 if let Some(e) = l.trace.events[..revealed]
                     .iter()
                     .find(|e| e.user as usize == i)
                 {
-                    Some((
-                        format!("Terminal {}", l.scn.user_ids[i]),
-                        vec![format!(
+                    Some(Hover {
+                        title: format!("Terminal {}", l.scn.user_ids[i]),
+                        lines: vec![format!(
                             "served · band {} · sat {}",
                             BANDS[e.color as usize], l.scn.sat_ids[e.sat as usize]
                         )],
-                    ))
+                        band: Some(e.color),
+                        interferer: None,
+                    })
                 } else {
                     let line = l
                         .trace
@@ -426,18 +685,58 @@ impl App {
                         .find(|u| u.user as usize == i)
                         .map(|u| u.reason.label().to_string())
                         .unwrap_or_else(|| "not yet assigned".into());
-                    Some((format!("Terminal {}", l.scn.user_ids[i]), vec![line]))
+                    Some(Hover {
+                        title: format!("Terminal {}", l.scn.user_ids[i]),
+                        lines: vec![line],
+                        band: None,
+                        interferer: None,
+                    })
                 }
             }
+            Picked::Interferer(i) => Some(Hover {
+                title: format!("Interferer {}", l.scn.interferer_ids[i]),
+                lines: vec!["non-Starlink · 20° exclusion field".into()],
+                band: None,
+                interferer: Some(i),
+            }),
         }
     }
 
-    /// Build the points + beams to display for the current frame.
-    fn build_world(&self) -> (Vec<PointInstance>, Vec<BeamInstance>) {
+    /// Enter satellite focus mode: isolate satellite `s` and fly to it.
+    fn enter_focus(&mut self, s: usize) {
+        self.focused_sat = Some(s);
+        self.focus_reveal = f64::INFINITY; // show the full assignment first
+        self.focus_playing = false;
+        self.selected = None;
+        if let Some(l) = self.loaded.as_ref() {
+            let p = l.sat_pos[s];
+            self.focus_on(p);
+        }
+    }
+
+    /// Beams assigned to the focused satellite, newest last (assignment order).
+    fn focus_beam_count(&self, s: usize) -> usize {
+        self.loaded
+            .as_ref()
+            .map(|l| l.trace.events.iter().filter(|e| e.sat as usize == s).count())
+            .unwrap_or(0)
+    }
+
+    /// Build the points + beams to display for the current frame. In satellite
+    /// focus mode the whole-constellation view is replaced by an isolated study
+    /// of one satellite.
+    fn build_world(
+        &self,
+        hover_interferer: Option<usize>,
+    ) -> (Vec<PointInstance>, Vec<BeamInstance>) {
         let Some(l) = &self.loaded else {
             return (Vec::new(), Vec::new());
         };
-        compose(l, self.revealed, &self.view_opts(), self.selected)
+        if let Some(s) = self.focused_sat {
+            compose_focus(l, s, self.focus_reveal, self.time, self.camera.eye())
+        } else {
+            compose(l, self.revealed, &self.view_opts(), self.selected, hover_interferer)
+        }
     }
 
     fn view_opts(&self) -> ViewOpts {
@@ -447,6 +746,7 @@ impl App {
             show_empty: self.show_empty,
             show_uncovered: self.show_uncovered,
             show_beams: self.show_beams,
+            show_interferers: self.show_interferers,
         }
     }
 
@@ -535,6 +835,8 @@ impl App {
             ui.toggle_value(&mut self.show_full, "Full");
             ui.toggle_value(&mut self.show_empty, "Partial");
             ui.toggle_value(&mut self.show_uncovered, "Uncovered");
+            ui.toggle_value(&mut self.show_interferers, "Interferers")
+                .on_hover_text("Non-Starlink satellites — hover one to see its 20° field of interference");
         });
 
         // Basemap.
@@ -558,10 +860,16 @@ impl App {
             self.tile_source = src;
             self.scene.set_tile_source(src);
         }
+        ui.add_space(7.0);
+        ui.toggle_value(&mut self.show_atmosphere, "Atmosphere halo")
+            .on_hover_text("Fresnel atmosphere glow — independent of the basemap");
 
         if changed_scn {
+            // A different scenario means different satellites — drop the focus.
+            self.focused_sat = None;
             self.load();
         } else if changed_algo {
+            // Same satellites: keep focus so the change re-renders for this one.
             self.rerun();
         }
     }
@@ -780,6 +1088,169 @@ impl App {
         });
         clicked
     }
+
+    /// Focus-mode study card (top-right): identity, a beam gauge, the per-band
+    /// breakdown, interferer proximity, and a scoped "replay" of just this
+    /// satellite's beams. Returns `true` when the user closes it.
+    fn focus_panel(&mut self, ui: &mut egui::Ui) -> bool {
+        const W: f32 = 278.0;
+        let Some(s) = self.focused_sat else { return false };
+        // Pull the immutable data first, then release the borrow before touching
+        // the scoped-replay state below.
+        let (sat_id, band_counts, total, near) = {
+            let Some(l) = self.loaded.as_ref() else { return false };
+            if s >= l.sat_pos.len() {
+                return false;
+            }
+            let mut band_counts = [0u32; 4];
+            for e in &l.trace.events {
+                if e.sat as usize == s {
+                    band_counts[e.color as usize] += 1;
+                }
+            }
+            let total: u32 = band_counts.iter().sum();
+            let sat_dir = l.sat_pos[s].normalize_or_zero();
+            let near: Vec<String> = l
+                .interferer_pos
+                .iter()
+                .enumerate()
+                .filter(|(_, ip)| ip.normalize_or_zero().dot(sat_dir) > FOCUS_INTERFERER_COS)
+                .map(|(i, _)| l.scn.interferer_ids[i].clone())
+                .collect();
+            (l.scn.sat_ids[s].clone(), band_counts, total, near)
+        };
+
+        let accent = egui::Color32::from_rgb(120, 220, 255);
+        let mut close = false;
+        ui.set_width(W);
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgba_unmultiplied(8, 12, 18, 226))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(120, 220, 255, 96),
+            ))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(13.0))
+            .show(ui, |ui| {
+                ui.set_width(W);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("◈ FOCUS").color(accent).size(10.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("✕").size(13.0)).frame(false))
+                            .on_hover_text("Exit focus (Esc)")
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(format!("Satellite {sat_id}"))
+                        .color(WHITE)
+                        .size(17.0)
+                        .strong(),
+                );
+                ui.add_space(9.0);
+
+                section(ui, "BEAMS");
+                ui.add(
+                    egui::ProgressBar::new(total as f32 / 32.0)
+                        .desired_height(10.0)
+                        .fill(accent)
+                        .text(
+                            egui::RichText::new(format!("{total} / 32"))
+                                .size(10.0)
+                                .color(egui::Color32::BLACK),
+                        ),
+                );
+                ui.add_space(9.0);
+
+                section(ui, "BANDS");
+                ui.horizontal(|ui| {
+                    for c in 0..4u8 {
+                        let col = band_color32(c);
+                        let n = band_counts[c as usize];
+                        let on = n > 0;
+                        let txt = egui::RichText::new(format!("{}·{}", BANDS[c as usize], n))
+                            .color(if on { egui::Color32::BLACK } else { col })
+                            .strong()
+                            .size(11.0);
+                        let fill = if on {
+                            col
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+                        };
+                        let _ = ui.add_sized([54.0, 24.0], egui::Button::new(txt).fill(fill));
+                    }
+                });
+                ui.add_space(9.0);
+
+                if near.is_empty() {
+                    ui.label(
+                        egui::RichText::new("no interferers in range")
+                            .color(DIM)
+                            .size(10.0),
+                    );
+                } else {
+                    let n = near.len();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ {n} interferer{} in range",
+                            if n == 1 { "" } else { "s" }
+                        ))
+                        .color(INTERFERER_UI)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new("nearest 20° field shown on the globe")
+                            .color(DIM)
+                            .size(9.0),
+                    );
+                }
+                ui.add_space(9.0);
+
+                section(ui, "REPLAY");
+                ui.horizontal(|ui| {
+                    let lbl = if self.focus_playing { "⏸" } else { "▶" };
+                    if ui.add_sized([30.0, 22.0], egui::Button::new(lbl)).clicked() {
+                        if self.focus_playing {
+                            self.focus_playing = false;
+                        } else {
+                            // Restart from the top if at (or past) the end.
+                            if !self.focus_reveal.is_finite() || self.focus_reveal as u32 >= total {
+                                self.focus_reveal = 0.0;
+                            }
+                            self.focus_playing = true;
+                        }
+                    }
+                    let mut shown = if self.focus_reveal.is_finite() {
+                        self.focus_reveal.min(total as f64)
+                    } else {
+                        total as f64
+                    };
+                    let resp = ui.add(
+                        egui::Slider::new(&mut shown, 0.0..=(total.max(1) as f64)).show_value(false),
+                    );
+                    if resp.dragged() || resp.changed() {
+                        self.focus_reveal = shown;
+                        self.focus_playing = false;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} / {}", shown as u32, total))
+                            .color(WHITE)
+                            .size(10.0),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("click another satellite · Esc to exit")
+                        .color(DIM)
+                        .size(9.0),
+                );
+            });
+        close
+    }
 }
 
 impl eframe::App for App {
@@ -796,15 +1267,26 @@ impl eframe::App for App {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.fullscreen {
-            self.fullscreen = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Esc leaves satellite focus first, then fullscreen — never trap the user.
+            if self.focused_sat.is_some() {
+                self.focused_sat = None;
+            } else if self.fullscreen {
+                self.fullscreen = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
         }
 
         // Pick up a finished background solve.
         if let Some(rx) = self.loading.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(l)) => {
+                    // Keep a valid focus across an algorithm rerun; drop a stale one.
+                    if self.focused_sat.is_some_and(|s| s >= l.sat_pos.len()) {
+                        self.focused_sat = None;
+                    }
+                    self.focus_reveal = f64::INFINITY;
+                    self.focus_playing = false;
                     self.loaded = Some(l);
                     self.revealed = 0.0;
                     self.playing = true;
@@ -847,12 +1329,34 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // Scoped replay of the focused satellite's own beams ("render out the
+        // change" for just that one).
+        if self.focus_playing {
+            if let Some(s) = self.focused_sat {
+                let n = self.focus_beam_count(s);
+                if !self.focus_reveal.is_finite() {
+                    self.focus_reveal = n as f64;
+                }
+                let rate = (n as f64 / 2.5).max(1.0); // whole satellite in ~2.5 s
+                self.focus_reveal = (self.focus_reveal + rate * dt as f64).min(n as f64);
+                if self.focus_reveal as usize >= n {
+                    self.focus_playing = false;
+                }
+            } else {
+                self.focus_playing = false;
+            }
+        }
+        // Keep repainting while focused so the reticle keeps pulsing.
+        if self.focused_sat.is_some() {
+            ctx.request_repaint();
+        }
+
         // Full-window 3D scene.
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let size = ui.available_size();
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                 if response.dragged() {
                     let d = response.drag_delta();
                     self.camera.orbit(d.x, d.y);
@@ -879,11 +1383,32 @@ impl eframe::App for App {
                 let streaming = self.scene.update(vp, self.camera.eye(), ph as f32);
                 self.scene
                     .set_camera(vp, self.camera.eye(), sun_dir(), self.time);
+                self.scene.set_atmosphere(self.show_atmosphere);
                 // Keep repainting while tiles are still streaming in.
                 if streaming {
                     ctx.request_repaint();
                 }
-                let (points, beams) = self.build_world();
+                // Click a satellite to focus it; click empty space to leave focus.
+                if response.clicked() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        match self.pick(p, rect, vp) {
+                            Some(Picked::Sat(s)) => self.enter_focus(s),
+                            _ => self.focused_sat = None,
+                        }
+                    }
+                }
+                // Resolve the hovered entity once: it drives both the tooltip and
+                // (for an interferer) its field-of-interference overlay. Suppressed
+                // in focus mode, where the focus panel carries the information.
+                let hover = if self.show_ui && self.focused_sat.is_none() {
+                    response
+                        .hover_pos()
+                        .and_then(|ptr| self.hover_entity(ptr, rect, vp).map(|h| (ptr, h)))
+                } else {
+                    None
+                };
+                let hover_interferer = hover.as_ref().and_then(|(_, h)| h.interferer);
+                let (points, beams) = self.build_world(hover_interferer);
                 self.scene.set_points(&points);
                 self.scene.set_beams(&beams);
                 self.scene.render();
@@ -894,28 +1419,24 @@ impl eframe::App for App {
                     egui::Color32::WHITE,
                 );
 
-                // Hover tooltip for satellites / terminals under the cursor.
-                if self.show_ui {
-                    if let Some(ptr) = response.hover_pos() {
-                        if let Some((title, lines)) = self.hover_entity(ptr, rect, vp) {
-                            egui::Area::new(egui::Id::new("hovertip"))
-                                .order(egui::Order::Tooltip)
-                                .fixed_pos(ptr + egui::vec2(16.0, 14.0))
-                                .show(ctx, |ui| {
-                                    glass().inner_margin(9.0).show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(title)
-                                                .color(WHITE)
-                                                .strong()
-                                                .size(12.0),
-                                        );
-                                        for l in lines {
-                                            ui.label(egui::RichText::new(l).color(DIM).size(11.0));
-                                        }
-                                    });
-                                });
-                        }
-                    }
+                // Hover tooltip, tinted by the hovered terminal's band.
+                if let Some((ptr, h)) = hover {
+                    egui::Area::new(egui::Id::new("hovertip"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(ptr + egui::vec2(16.0, 14.0))
+                        .show(ctx, |ui| {
+                            glass(h.band).inner_margin(9.0).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(h.title)
+                                        .color(WHITE)
+                                        .strong()
+                                        .size(12.0),
+                                );
+                                for l in h.lines {
+                                    ui.label(egui::RichText::new(l).color(DIM).size(11.0));
+                                }
+                            });
+                        });
                 }
             });
 
@@ -923,21 +1444,33 @@ impl eframe::App for App {
         // all selectors top-left, coverage/solve top-right, transport
         // bottom-center, unserved inspector bottom-right. `H` hides it all.
         let mut clicked = None;
+        let mut close_focus = false;
         if self.show_ui {
             egui::Area::new(egui::Id::new("left"))
                 .anchor(egui::Align2::LEFT_TOP, [18.0, 16.0])
                 .show(ctx, |ui| self.left_panel(ui));
-            egui::Area::new(egui::Id::new("cov"))
-                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 16.0])
-                .show(ctx, |ui| self.coverage_module(ui));
-            egui::Area::new(egui::Id::new("transport"))
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
-                .show(ctx, |ui| self.transport_module(ui));
-            egui::Area::new(egui::Id::new("uns"))
-                .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -16.0])
-                .show(ctx, |ui| clicked = self.unserved_module(ui));
+            if self.focused_sat.is_some() {
+                // Focus mode: one dedicated study panel stands in for the global
+                // coverage / transport / unserved readouts.
+                egui::Area::new(egui::Id::new("focus"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-18.0, 16.0])
+                    .show(ctx, |ui| close_focus = self.focus_panel(ui));
+            } else {
+                egui::Area::new(egui::Id::new("cov"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-18.0, 16.0])
+                    .show(ctx, |ui| self.coverage_module(ui));
+                egui::Area::new(egui::Id::new("transport"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
+                    .show(ctx, |ui| self.transport_module(ui));
+                egui::Area::new(egui::Id::new("uns"))
+                    .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -16.0])
+                    .show(ctx, |ui| clicked = self.unserved_module(ui));
+            }
         }
 
+        if close_focus {
+            self.focused_sat = None;
+        }
         if let Some(i) = clicked {
             if self.selected == Some(i) {
                 self.selected = None;
@@ -982,14 +1515,37 @@ fn reason_color(r: Reason) -> egui::Color32 {
     }
 }
 /// Subtle dark backing for the transient hover tooltip (the only floating
-/// element that needs contrast over arbitrary scene content).
-fn glass() -> egui::Frame {
-    egui::Frame::none()
-        .fill(egui::Color32::from_rgba_unmultiplied(6, 8, 12, 210))
-        .stroke(egui::Stroke::new(
-            1.0,
+/// element that needs contrast over arbitrary scene content). When the hovered
+/// item carries a band assignment, the glass takes a faint hint of that band
+/// color: a nudged fill plus a clearer band-colored hairline border.
+fn glass(band: Option<u8>) -> egui::Frame {
+    let (fill, stroke) = match band {
+        Some(c) => {
+            let rgb = band_rgb(c);
+            let mix = |base: f32, ch: f32| (base + ch * 60.0).min(255.0) as u8;
+            (
+                egui::Color32::from_rgba_unmultiplied(
+                    mix(6.0, rgb[0]),
+                    mix(8.0, rgb[1]),
+                    mix(12.0, rgb[2]),
+                    214,
+                ),
+                egui::Color32::from_rgba_unmultiplied(
+                    (rgb[0] * 255.0) as u8,
+                    (rgb[1] * 255.0) as u8,
+                    (rgb[2] * 255.0) as u8,
+                    120,
+                ),
+            )
+        }
+        None => (
+            egui::Color32::from_rgba_unmultiplied(6, 8, 12, 210),
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-        ))
+        ),
+    };
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
         .rounding(egui::Rounding::same(9.0))
         .inner_margin(egui::Margin::same(9.0))
 }
@@ -1086,6 +1642,11 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
         .iter()
         .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
         .collect();
+    let interferer_pos = scn
+        .interferers
+        .iter()
+        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
+        .collect();
     let mut reason_counts = [0usize; 4];
     for u in &trace.unassigned {
         reason_counts[reason_idx(u.reason)] += 1;
@@ -1095,6 +1656,7 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
         feas,
         user_pos,
         sat_pos,
+        interferer_pos,
         trace,
         reason_counts,
     })
@@ -1116,7 +1678,9 @@ fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
     Ok((Arc::new(device), Arc::new(queue)))
 }
 
-/// All view layers on — the default look for headless stills and sequences.
+/// All scene layers on — the default look for headless stills and sequences.
+/// Interferers stay off here to keep the hero renders clean (their field is a
+/// hover-only overlay anyway).
 fn full_view() -> ViewOpts {
     ViewOpts {
         bands: [true; 4],
@@ -1124,6 +1688,7 @@ fn full_view() -> ViewOpts {
         show_empty: true,
         show_uncovered: true,
         show_beams: true,
+        show_interferers: false,
     }
 }
 
@@ -1189,11 +1754,12 @@ fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
     let (device, queue) = init_gpu()?;
     let l = load_scenario(scenario, Algorithm::Optimized)?;
     let revealed = (l.trace.events.len() as f64) * fraction.clamp(0.0, 1.0);
-    let (points, beams) = compose(&l, revealed, &full_view(), None);
+    let (points, beams) = compose(&l, revealed, &full_view(), None, None);
 
     let mut scene = Scene::new(device.clone(), queue.clone());
     // Enable the atmosphere halo for the still (tiles won't stream in headlessly).
     scene.set_tile_source(tiles::TileSource::Dark);
+    scene.set_atmosphere(true);
     scene.resize(w, h);
     let cam = OrbitCamera::default();
     scene.set_camera(cam.view_proj(w as f32 / h as f32), cam.eye(), sun_dir(), 0.0);
@@ -1229,6 +1795,7 @@ fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), Str
 
     let mut scene = Scene::new(device.clone(), queue.clone());
     scene.set_tile_source(tiles::TileSource::Dark);
+    scene.set_atmosphere(true);
     scene.resize(w, h);
 
     std::fs::create_dir_all(dir).map_err(|e| format!("create {dir}: {e}"))?;
@@ -1243,7 +1810,7 @@ fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), Str
             ..OrbitCamera::default()
         };
         scene.set_camera(cam.view_proj(aspect), cam.eye(), sun_dir(), i as f32 * 0.05);
-        let (points, beams) = compose(&l, total * f, &opts, None);
+        let (points, beams) = compose(&l, total * f, &opts, None, None);
         scene.set_points(&points);
         scene.set_beams(&beams);
         scene.render();

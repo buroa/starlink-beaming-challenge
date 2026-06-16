@@ -1,6 +1,11 @@
-//! Starlink beam-planning solver CLI: reads a scenario file (argv[1]) and writes
-//! the validator-format beam allocation (plus a near-optimality certificate
-//! header) to stdout.
+//! Starlink beam-planning solver CLI: reads a scenario file and writes the
+//! validator-format beam allocation (plus a near-optimality certificate header)
+//! to stdout.
+//!
+//!   beam-planner <scenario.txt> [--max]
+//!
+//! `--max` selects the maximum-coverage algorithm: a much larger LNS budget on
+//! residual-gap components — slower (seconds), recovers the last few users.
 
 use beam_planner::{assign, feasibility, io};
 use std::process::exit;
@@ -11,8 +16,10 @@ use std::time::{Duration, Instant};
 const REPAIR_BUDGET: Duration = Duration::from_secs(120);
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: beam-planner <scenario.txt>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let intense = args.iter().any(|a| a == "--max");
+    let path = args.iter().find(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| {
+        eprintln!("usage: beam-planner <scenario.txt> [--max]");
         exit(2);
     });
 
@@ -27,7 +34,7 @@ fn main() {
     });
 
     let feas = feasibility::build(&scn);
-    let sol = assign::solve(&scn, &feas, start + REPAIR_BUDGET);
+    let sol = assign::solve(&scn, &feas, start + REPAIR_BUDGET, intense);
 
     let cert = io::Certificate {
         total_users: scn.users.len(),

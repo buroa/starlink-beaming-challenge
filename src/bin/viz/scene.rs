@@ -76,8 +76,8 @@ pub struct Scene {
 
     /// Tile-shading style (passed to shaders as camera `params.w`).
     map_style: f32,
-    /// Draw the Fresnel atmosphere halo? Off when the basemap is off, so a
-    /// transparent earth shows no ring.
+    /// Draw the Fresnel atmosphere halo? Controlled independently of the basemap
+    /// via [`Scene::set_atmosphere`], so the hue can glow over a transparent earth.
     draw_atmo: bool,
 
     size: (u32, u32),
@@ -353,11 +353,16 @@ impl Scene {
         self.tile_globe.update(view_proj, eye, viewport_h)
     }
 
-    /// Switch the basemap (or turn it off → transparent earth, no atmosphere).
+    /// Switch the basemap (or turn it off → transparent earth). The atmosphere
+    /// halo is controlled separately by [`Scene::set_atmosphere`].
     pub fn set_tile_source(&mut self, source: TileSource) {
         self.tile_globe.set_source(source);
         self.map_style = source.style();
-        self.draw_atmo = source != TileSource::Off;
+    }
+
+    /// Show or hide the Fresnel atmosphere halo, independent of the basemap.
+    pub fn set_atmosphere(&mut self, on: bool) {
+        self.draw_atmo = on;
     }
 
     pub fn set_camera(&self, view_proj: Mat4, cam_pos: Vec3, sun: Vec3, time: f32) {
@@ -443,8 +448,8 @@ impl Scene {
             // Live satellite globe (group 0 camera already bound).
             self.tile_globe.render(&mut pass);
 
-            // Atmosphere halo — only with a basemap (a transparent earth has no
-            // ring). Skipped from inside the globe, where it would not be seen.
+            // Fresnel atmosphere halo — toggled independently of the basemap
+            // (see set_atmosphere), so the glow can ride over a transparent earth.
             if self.draw_atmo {
                 pass.set_pipeline(&self.atmo_pipeline);
                 pass.set_vertex_buffer(0, self.globe_vbuf.slice(..));

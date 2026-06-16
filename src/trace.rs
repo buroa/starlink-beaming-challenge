@@ -20,6 +20,12 @@ pub enum Algorithm {
     /// augmenting repair + parallel large-neighborhood search. This is what the
     /// CLI emits, so its coverage matches the reported certificate exactly.
     Optimized,
+    /// Same pipeline as [`Optimized`] but with a much larger LNS budget on any
+    /// component that still has a residual gap — the maximum-coverage mode. It is
+    /// markedly slower (seconds, not sub-second) and recovers the last few users a
+    /// normal run leaves behind (e.g. +5 on the 100k case), so its coverage can
+    /// exceed the default certificate's.
+    Maximum,
     GreedyLeastLoaded,
     GreedyHighestElevation,
     GreedyLeastContended,
@@ -37,8 +43,9 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    pub const ALL: [Algorithm; 8] = [
+    pub const ALL: [Algorithm; 9] = [
         Algorithm::Optimized,
+        Algorithm::Maximum,
         Algorithm::GreedyLeastLoaded,
         Algorithm::GreedyHighestElevation,
         Algorithm::GreedyLeastContended,
@@ -50,6 +57,7 @@ impl Algorithm {
     pub fn name(self) -> &'static str {
         match self {
             Algorithm::Optimized => "Optimized · ensemble + repair",
+            Algorithm::Maximum => "Maximum · intensive search",
             Algorithm::GreedyLeastLoaded => "Greedy · least-loaded",
             Algorithm::GreedyHighestElevation => "Greedy · highest elevation",
             Algorithm::GreedyLeastContended => "Greedy · least-contended",
@@ -172,7 +180,8 @@ impl State {
 
 pub fn run(scn: &Scenario, feas: &Feasibility, algo: Algorithm) -> Trace {
     match algo {
-        Algorithm::Optimized => run_optimized(scn, feas),
+        Algorithm::Optimized => run_optimized(scn, feas, false),
+        Algorithm::Maximum => run_optimized(scn, feas, true),
         Algorithm::Matching => run_matching(scn, feas),
         Algorithm::LnsOnly => run_lns_only(scn, feas),
         _ => run_greedy(scn, feas, algo),
@@ -182,13 +191,13 @@ pub fn run(scn: &Scenario, feas: &Feasibility, algo: Algorithm) -> Trace {
 /// Run the full production solver and present its result as a trace. The reveal
 /// order is the solver's own most-constrained-first commit order, so the
 /// animation tells a coherent story; the final coverage equals the CLI's.
-fn run_optimized(scn: &Scenario, feas: &Feasibility) -> Trace {
+fn run_optimized(scn: &Scenario, feas: &Feasibility, intense: bool) -> Trace {
     let n_users = scn.users.len();
     let n_sats = scn.sats.len();
     // Match the CLI's repair budget so the visualizer's coverage is guaranteed
     // identical to the certificate (repair converges in a few seconds anyway).
     let deadline = Instant::now() + Duration::from_secs(300);
-    let sol = assign::solve(scn, feas, deadline);
+    let sol = assign::solve(scn, feas, deadline, intense);
 
     let mut user_sat = vec![-1i32; n_users];
     let mut user_color = vec![0u8; n_users];
