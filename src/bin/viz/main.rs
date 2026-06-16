@@ -1100,10 +1100,9 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
     })
 }
 
-/// Headless: render one frame of a scenario to a PNG (no window). Used to verify
-/// and preview the renderer. `--shot <scenario.txt> <out.png> [fraction 0..1]`.
-fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
-    let (w, h) = (1600u32, 1000u32);
+/// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
+/// `--shot` and the `--frames` sequence renderer.
+fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1114,36 +1113,29 @@ fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
             .map_err(|e| format!("device: {e}"))?;
-    let device = Arc::new(device);
-    let queue = Arc::new(queue);
+    Ok((Arc::new(device), Arc::new(queue)))
+}
 
-    let l = load_scenario(scenario, Algorithm::Optimized)?;
-    let revealed = (l.trace.events.len() as f64) * fraction.clamp(0.0, 1.0);
-    let opts = ViewOpts {
+/// All view layers on — the default look for headless stills and sequences.
+fn full_view() -> ViewOpts {
+    ViewOpts {
         bands: [true; 4],
         show_full: true,
         show_empty: true,
         show_uncovered: true,
         show_beams: true,
-    };
-    let (points, beams) = compose(&l, revealed, &opts, None);
+    }
+}
 
-    let mut scene = Scene::new(device.clone(), queue.clone());
-    // Enable the atmosphere halo for the still (tiles won't stream in headlessly).
-    scene.set_tile_source(tiles::TileSource::Dark);
-    scene.resize(w, h);
-    let cam = OrbitCamera::default();
-    scene.set_camera(
-        cam.view_proj(w as f32 / h as f32),
-        cam.eye(),
-        sun_dir(),
-        0.0,
-    );
-    scene.set_points(&points);
-    scene.set_beams(&beams);
-    scene.render();
-
-    // Read the offscreen color texture back and save it.
+/// Copy the scene's offscreen color texture back to the CPU and save it as a PNG.
+fn save_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    w: u32,
+    h: u32,
+    out: &str,
+) -> Result<(), String> {
     let bpp = 4u32;
     let unpadded = w * bpp;
     let padded = unpadded.div_ceil(256) * 256;
@@ -1187,13 +1179,77 @@ fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
     }
     image::save_buffer(out, &pixels, w, h, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("save {out}: {e}"))?;
+    Ok(())
+}
+
+/// Headless: render one frame of a scenario to a PNG (no window). Used to verify
+/// and preview the renderer. `--shot <scenario.txt> <out.png> [fraction 0..1]`.
+fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
+    let (w, h) = (1600u32, 1000u32);
+    let (device, queue) = init_gpu()?;
+    let l = load_scenario(scenario, Algorithm::Optimized)?;
+    let revealed = (l.trace.events.len() as f64) * fraction.clamp(0.0, 1.0);
+    let (points, beams) = compose(&l, revealed, &full_view(), None);
+
+    let mut scene = Scene::new(device.clone(), queue.clone());
+    // Enable the atmosphere halo for the still (tiles won't stream in headlessly).
+    scene.set_tile_source(tiles::TileSource::Dark);
+    scene.resize(w, h);
+    let cam = OrbitCamera::default();
+    scene.set_camera(cam.view_proj(w as f32 / h as f32), cam.eye(), sun_dir(), 0.0);
+    scene.set_points(&points);
+    scene.set_beams(&beams);
+    scene.render();
+
+    save_frame(&device, &queue, &scene, w, h, out)?;
     eprintln!(
-        "wrote {out} ({}x{}, {} beams of {})",
-        w,
-        h,
+        "wrote {out} ({w}x{h}, {} beams of {})",
         revealed as usize,
         l.trace.events.len()
     );
+    Ok(())
+}
+
+/// Headless: render a whole playback sequence to numbered PNGs (`frame_00000.png`,
+/// …) under `dir`, ready to be encoded into a GIF/MP4 by an external tool such as
+/// ffmpeg. The scenario is solved once and the GPU device reused across frames, so
+/// this is far cheaper than calling `--shot` per frame.
+///
+/// `--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]`: the playback
+/// fraction sweeps 0→1 across the frames while the camera orbits by `orbit_degrees`
+/// total (default 0), so the beam network paints itself onto a slowly turning globe.
+fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), String> {
+    if n == 0 {
+        return Err("n_frames must be > 0".into());
+    }
+    let (w, h) = (1600u32, 1000u32);
+    let (device, queue) = init_gpu()?;
+    let l = load_scenario(scenario, Algorithm::Optimized)?;
+    let opts = full_view();
+
+    let mut scene = Scene::new(device.clone(), queue.clone());
+    scene.set_tile_source(tiles::TileSource::Dark);
+    scene.resize(w, h);
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {dir}: {e}"))?;
+    let total = l.trace.events.len() as f64;
+    let aspect = w as f32 / h as f32;
+    let yaw0 = OrbitCamera::default().yaw;
+
+    for i in 0..n {
+        let f = if n == 1 { 1.0 } else { i as f64 / (n - 1) as f64 };
+        let cam = OrbitCamera {
+            yaw: yaw0 - orbit_deg.to_radians() * f as f32,
+            ..OrbitCamera::default()
+        };
+        scene.set_camera(cam.view_proj(aspect), cam.eye(), sun_dir(), i as f32 * 0.05);
+        let (points, beams) = compose(&l, total * f, &opts, None);
+        scene.set_points(&points);
+        scene.set_beams(&beams);
+        scene.render();
+        save_frame(&device, &queue, &scene, w, h, &format!("{dir}/frame_{i:05}.png"))?;
+    }
+    eprintln!("wrote {n} frames to {dir}/ ({w}x{h}, {} beams)", total as usize);
     Ok(())
 }
 
@@ -1209,6 +1265,25 @@ fn main() -> eframe::Result<()> {
         let fraction = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1.0);
         if let Err(e) = screenshot(scenario, out, fraction) {
             eprintln!("screenshot failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.get(1).map(|s| s == "--frames").unwrap_or(false) {
+        let scenario = args
+            .get(2)
+            .expect("--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]");
+        let dir = args
+            .get(3)
+            .expect("--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]");
+        let n: usize = args
+            .get(4)
+            .and_then(|s| s.parse().ok())
+            .expect("--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]");
+        let orbit_deg: f32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        if let Err(e) = frames(scenario, dir, n, orbit_deg) {
+            eprintln!("frames failed: {e}");
             std::process::exit(1);
         }
         return Ok(());
