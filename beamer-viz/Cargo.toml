@@ -1,0 +1,51 @@
+# Beamer — the GPU visualizer: the `viz` rendering library, the native `beamer-viz`
+# desktop GUI (bin/main.rs), and the browser visualizer app (src/lib.rs's
+# wasm-bindgen `start` / `trace_scenario`). Depends on `solver` for the core.
+# Built for the web with wasm-pack — see package.json / webpack.config.mjs.
+[package]
+name = "beamer-viz"
+version.workspace = true
+edition.workspace = true
+description = "Beamer: GPU visualizer desktop GUI + browser WASM app."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "beamer-viz"
+path = "bin/main.rs"
+
+[features]
+default = ["parallel"]
+# Multicore solve: rayon in the solver core + (on wasm) wasm-bindgen-rayon's pool.
+parallel = ["beamer/parallel", "dep:wasm-bindgen-rayon"]
+
+[dependencies]
+# The solver core (no `app` loader — just the library + the serde wire format).
+beamer = { path = "../beamer", default-features = false, features = ["wire"] }
+web-time.workspace = true
+# (Scenario, Feasibility, Trace) wire format for the Worker handoff (and its test).
+postcard = { version = "1", features = ["alloc"] }
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "0.3"
+
+# Native-only: ureq is a blocking-socket HTTP client (basemap tiles).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = "2"
+
+# Browser-only: the <canvas> handed to eframe's WebRunner, async tile fetch, the
+# future→Promise bridge, the (Scenario, Feasibility, Trace) handoff, and the pool.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-rayon = { workspace = true, optional = true }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+wasm-bindgen-futures = "0.4"
+# eframe only enables wgpu's "webgpu" backend on web; add "webgl" so we can force
+# Backends::GL (wgpu 22's WebGPU path is rejected by current browsers).
+wgpu = { version = "22", features = ["webgl"] }
+ehttp = "0.5"
+js-sys = "0.3"

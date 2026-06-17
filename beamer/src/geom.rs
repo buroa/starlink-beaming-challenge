@@ -8,6 +8,7 @@
 //! validation failure; a false-reject merely costs at most a marginal user).
 
 /// Vector / point in earth-centered, earth-fixed coordinates (kilometres).
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Vec3 {
     pub x: f64,

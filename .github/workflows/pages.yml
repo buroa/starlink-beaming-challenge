@@ -1,0 +1,73 @@
+name: Deploy to GitHub Pages
+
+# Builds both webpack apps (wasm-pack single + multi-thread → webpack) and
+# publishes the assembled site: the visualizer at `/`, the solver at `/solver`.
+# coi-serviceworker.js (bundled into each app) supplies the COOP/COEP isolation
+# Pages can't set via headers, so the threaded builds light up.
+#
+# One-time setup: repo Settings → Pages → Build and deployment → Source =
+# "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-progress run finish (don't cancel a deploy).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + rust-src + the wasm target; this just
+      # ensures it's installed. wasm-pack (an npm devDependency) drives the build;
+      # the threaded -Z build-std + atomics rustflags come from each app's
+      # package.json + .cargo/config.toml.
+      - name: Install Rust (nightly + rust-src + wasm target)
+        run: rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Each app: npm ci installs webpack + wasm-pack, then `build` runs
+      # wasm-pack (st + mt) and webpack. wasm-pack resolves the rayon worker, so
+      # there's no post-build JS patching.
+      - name: Build the solver app
+        run: cd beamer && npm ci && npm run build
+      - name: Build the visualizer app
+        run: cd beamer-viz && npm ci && npm run build
+
+      # Assemble the site: the visualizer at `/`, the solver at `/solver`. Each
+      # app's dist is self-contained (its own pkg, coi-serviceworker, test_cases).
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -r beamer-viz/dist/. _site/
+          cp -r beamer/dist _site/solver
+          touch _site/.nojekyll
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

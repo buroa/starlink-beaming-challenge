@@ -118,11 +118,10 @@ mod tests {
     /// every brute-force-visible sat must appear in the 27-cell candidate set.
     #[test]
     fn grid_returns_superset_of_visible() {
-        for case in [
-            "test_cases/07_eighteen_planes.txt",
-            "test_cases/11_one_hundred_thousand_users.txt",
-        ] {
-            let text = std::fs::read_to_string(case).unwrap();
+        for case in ["07_eighteen_planes.txt", "11_one_hundred_thousand_users.txt"] {
+            // test_cases/ lives at the workspace root, one level above this crate.
+            let path = format!("{}/../test_cases/{case}", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(&path).unwrap();
             let scn = Scenario::parse(&text).unwrap();
             let grid = Grid::build(&scn.sats, &scn.users);
             for (ui, &up) in scn.users.iter().enumerate() {

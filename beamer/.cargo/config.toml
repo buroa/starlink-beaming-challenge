@@ -1,0 +1,21 @@
+# Defaults for building this app with wasm-pack.
+[build]
+target = "wasm32-unknown-unknown"
+
+# The threaded (multi-thread) build's flags: atomics + an imported, shared,
+# bounded memory + the TLS / heap-base globals wasm-bindgen's thread transform
+# needs. These apply to every wasm32 build here — so the single-thread build
+# (`build:wasm-st`) clears RUSTFLAGS (cross-env RUSTFLAGS=) to opt out and link
+# against the plain, non-atomics std. (cargo can't scope rustflags per feature.)
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--max-memory=2147483648",
+  "-C", "link-arg=--export=__heap_base",
+  "-C", "link-arg=--export-if-defined=__wasm_init_tls",
+  "-C", "link-arg=--export-if-defined=__tls_size",
+  "-C", "link-arg=--export-if-defined=__tls_align",
+  "-C", "link-arg=--export-if-defined=__tls_base",
+]

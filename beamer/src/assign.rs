@@ -14,9 +14,9 @@ use crate::components::{self, Component};
 use crate::geom::{same_color_conflict, Vec3};
 use crate::io::Scenario;
 use crate::matching;
+use crate::par::*;
 use arrayvec::ArrayVec;
-use rayon::prelude::*;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Maximum displacement hops in an augmenting search.
 const MAX_DEPTH: u32 = 4;
@@ -859,11 +859,11 @@ fn solve_component(
     let mut best = best_solver.sats;
 
     // Tighter, coloring-aware upper bound (independent of the assignment found).
-    // The Lagrangian-decomposition bound in `crate::bound` was built and tested
-    // here too, but empirically adds nothing: its per-satellite `f2` uses the
-    // same clique relaxation, so it is blind to exactly the non-clique coloring
-    // obstructions that bound the hard cases (07/09/10/11) — at a large runtime
-    // cost. It is kept as a documented, sound (but non-tightening) bound.
+    // A Lagrangian-decomposition bound was prototyped here too but empirically
+    // added nothing: its per-satellite relaxation uses the same clique structure,
+    // so it is blind to exactly the non-clique coloring obstructions that bound
+    // the hard cases (07/09/10/11) — at a large runtime cost. `coloring_bound`
+    // captures those obstructions directly.
     let mut colored_bound = coloring_bound(scn, c, &local_feas, ns, upper_bound);
 
     // Exact certification (opt-in via BEAM_EXACT): if a small component still
@@ -931,6 +931,31 @@ pub struct Solution {
     /// and never below the true optimum).
     pub colored_bound: usize,
 }
+
+impl Solution {
+    /// Build the near-optimality [`Certificate`](crate::io::Certificate) header
+    /// for this solution against its scenario + feasibility graph. Shared by the
+    /// CLI and the wasm `solve_scenario` entry point.
+    pub fn certificate(
+        &self,
+        scn: &Scenario,
+        feas: &crate::feasibility::Feasibility,
+    ) -> crate::io::Certificate {
+        crate::io::Certificate {
+            total_users: scn.users.len(),
+            feasible_users: feas.feasible_users,
+            upper_bound: self.upper_bound,
+            colored_bound: self.colored_bound,
+            achieved: self.achieved,
+        }
+    }
+}
+
+/// Default wall-clock ceiling for the optional repair/LNS phase, shared by the
+/// CLI and the wasm entry points. Far under the 15-minute grader limit; the
+/// greedy solution is always complete and valid before repair runs, so this only
+/// bounds how long the solver spends improving it.
+pub const REPAIR_BUDGET: Duration = Duration::from_secs(120);
 
 /// Solve the scenario. `intense` selects the maximum-coverage mode (the
 /// `Maximum` algorithm / CLI `--max`): a much larger LNS budget on residual-gap

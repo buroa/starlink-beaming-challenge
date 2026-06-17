@@ -5,7 +5,7 @@
 //! flowing data packets. Drawn to an offscreen texture the egui layer
 //! composites.
 
-use crate::tiles::{TileGlobe, TileSource};
+use super::tiles::{TileGlobe, TileSource};
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use std::sync::Arc;
@@ -338,6 +338,9 @@ impl Scene {
     pub fn color_view(&self) -> &wgpu::TextureView {
         &self.color_view
     }
+    /// Used by the native headless frame capture (`save_frame`); wasm renders
+    /// straight to the canvas and never reads the offscreen color texture back.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn color_texture(&self) -> &wgpu::Texture {
         &self.color_tex
     }

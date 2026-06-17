@@ -2,3 +2,12 @@
 .DS_Store
 Thumbs.db
 target/
+
+# Per-app build outputs (wasm-pack + webpack + npm).
+node_modules/
+pkg/
+pkg-parallel/
+dist/
+
+# CI Pages artifact
+_site/

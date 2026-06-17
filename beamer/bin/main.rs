@@ -2,24 +2,21 @@
 //! validator-format beam allocation (plus a near-optimality certificate header)
 //! to stdout.
 //!
-//!   beam-planner <scenario.txt> [--max]
+//!   beamer <scenario.txt> [--max]
 //!
 //! `--max` selects the maximum-coverage algorithm: a much larger LNS budget on
 //! residual-gap components — slower (seconds), recovers the last few users.
 
-use beam_planner::{assign, feasibility, io};
+use beamer::assign::REPAIR_BUDGET;
+use beamer::{assign, feasibility, io};
 use std::process::exit;
-use std::time::{Duration, Instant};
-
-/// Wall-clock ceiling for the (optional) repair phase — far under the 15-minute
-/// limit; the greedy solution is always complete and valid before repair runs.
-const REPAIR_BUDGET: Duration = Duration::from_secs(120);
+use web_time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let intense = args.iter().any(|a| a == "--max");
     let path = args.iter().find(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| {
-        eprintln!("usage: beam-planner <scenario.txt> [--max]");
+        eprintln!("usage: beamer <scenario.txt> [--max]");
         exit(2);
     });
 
@@ -36,13 +33,7 @@ fn main() {
     let feas = feasibility::build(&scn);
     let sol = assign::solve(&scn, &feas, start + REPAIR_BUDGET, intense);
 
-    let cert = io::Certificate {
-        total_users: scn.users.len(),
-        feasible_users: feas.feasible_users,
-        upper_bound: sol.upper_bound,
-        colored_bound: sol.colored_bound,
-        achieved: sol.achieved,
-    };
+    let cert = sol.certificate(&scn, &feas);
     io::write_solution(std::io::stdout().lock(), &scn, &sol.per_sat, &cert)
         .expect("write solution");
 }

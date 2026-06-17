@@ -6,8 +6,9 @@
 use crate::geom::{interferes, visible, Vec3};
 use crate::index::Grid;
 use crate::io::Scenario;
-use rayon::prelude::*;
+use crate::par::*;
 
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct Feasibility {
     /// `sats[u]` = sorted satellite indices user `u` may be served by.
     pub sats: Vec<Vec<u32>>,

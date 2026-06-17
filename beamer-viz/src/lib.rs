@@ -5,14 +5,12 @@
 //! satellites, control the playback speed, and inspect exactly why any terminal
 //! could not be served.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod camera;
 mod scene;
 mod tiles;
 
-use beam_planner::trace::{self, Algorithm, Reason, Trace};
-use beam_planner::{feasibility, io};
+use beamer::trace::{self, Algorithm, Reason, Trace};
+use beamer::{feasibility, io};
 use camera::OrbitCamera;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
@@ -607,23 +605,41 @@ impl App {
             wgpu::FilterMode::Linear,
         );
 
-        let mut scenarios: Vec<(String, String)> = std::fs::read_dir(test_cases_dir())
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "txt").unwrap_or(false))
-                    .map(|p| {
-                        let label = p
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        (label, p.to_string_lossy().into_owned())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        scenarios.sort();
+        // Native: scan ./test_cases for *.txt — the second tuple field is a PATH,
+        // read lazily at solve time (the 100k file is 6.7 MB).
+        #[cfg(not(target_arch = "wasm32"))]
+        let scenarios: Vec<(String, String)> = {
+            let mut s: Vec<(String, String)> = std::fs::read_dir(test_cases_dir())
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map(|x| x == "txt").unwrap_or(false))
+                        .map(|p| {
+                            let label = p
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            (label, p.to_string_lossy().into_owned())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            s.sort();
+            s
+        };
+        // WASM has no filesystem: the second tuple field is a URL (relative to
+        // web/beamer.html), fetched on demand by `load()`.
+        #[cfg(target_arch = "wasm32")]
+        let scenarios: Vec<(String, String)> = [
+            "00_example", "01_simplest_possible", "02_two_users", "03_five_users",
+            "04_one_interferer", "05_equatorial_plane", "06_partially_fullfillable",
+            "07_eighteen_planes", "08_eighteen_planes_northern", "09_ten_thousand_users",
+            "10_ten_thousand_users_geo_belt", "11_one_hundred_thousand_users",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), format!("test_cases/{n}.txt")))
+        .collect();
 
         let mut app = App {
             scene,
@@ -663,8 +679,21 @@ impl App {
             last_pick: None,
         };
         style_egui(&cc.egui_ctx);
-        // Open on the headline 100k-user scenario and start playing immediately.
-        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with("11")) {
+        // On the web, default the basemap on to show off the live tile streaming
+        // (Off — the transparent globe over the nebula — is one click away in the
+        // Basemap picker).
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.tile_source = tiles::TileSource::Dark;
+            app.scene.set_tile_source(tiles::TileSource::Dark);
+        }
+        // Native opens on the headline 100k case; wasm solves inline (for now), so
+        // default to a fast, globe-filling scenario instead.
+        #[cfg(not(target_arch = "wasm32"))]
+        let default_prefix = "11";
+        #[cfg(target_arch = "wasm32")]
+        let default_prefix = "09";
+        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with(default_prefix)) {
             app.current = i;
         }
         app.load();
@@ -694,17 +723,36 @@ impl App {
         // Invalidate per-frame caches keyed by the old scenario.
         self.last_compose_key = None;
         self.last_pick = None;
-        let Some((_, path)) = self.scenarios.get(self.current).cloned() else {
+        let Some((_, src)) = self.scenarios.get(self.current).cloned() else {
             self.error = Some("No scenarios found in ./test_cases".into());
             self.loading = None;
             return;
         };
         let algo = self.algo;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(load_scenario(&path, algo));
-        });
-        self.loading = Some(rx);
+        // Native: solve on a background thread (`src` is a path), polled in
+        // update() so the 100k case never freezes the window.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(load_scenario(&src, algo));
+            });
+            self.loading = Some(rx);
+        }
+        // WASM: `src` is a URL. Fetch it, then solve in a Web Worker (the solve
+        // would otherwise block the render thread — ~32 s on the 100k case). The
+        // worker returns the result serialized; we rebuild `Loaded` and deliver
+        // it through the same mpsc channel the native path uses, so update()'s
+        // poll is unchanged and the "Solving…" overlay shows throughout.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.loading = Some(rx);
+            let algo_idx = Algorithm::ALL.iter().position(|&a| a == algo).unwrap_or(0) as u8;
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = tx.send(solve_via_worker(&src, algo_idx).await);
+            });
+        }
     }
 
     /// Re-solve (e.g. after an algorithm change). Re-parsing is cheap; the solve
@@ -1449,7 +1497,7 @@ fn loading_overlay(painter: &egui::Painter, rect: egui::Rect, t: f32, name: &str
     let rot = |x: f32, y: f32| c + egui::vec2(x * ca - y * sa, x * sa + y * ca);
     let r = 120.0;
     let tick = 26.0;
-    let st = egui::Stroke::new(1.5, alpha(75));
+    let st = egui::Stroke::new(1.5_f32, alpha(75));
     for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
         let (cx, cy) = (sx * r, sy * r);
         painter.line_segment([rot(cx, cy), rot(cx - sx * tick, cy)], st);
@@ -1457,10 +1505,10 @@ fn loading_overlay(painter: &egui::Painter, rect: egui::Rect, t: f32, name: &str
     }
 
     // Steady inner ring + two outward "ping" rings.
-    painter.circle_stroke(c, 52.0, egui::Stroke::new(1.0, alpha(45)));
+    painter.circle_stroke(c, 52.0, egui::Stroke::new(1.0_f32, alpha(45)));
     for k in 0..2 {
         let f = ((t / 1.5) + k as f32 * 0.5).fract();
-        painter.circle_stroke(c, 52.0 + f * 92.0, egui::Stroke::new(1.0, alpha(((1.0 - f) * 80.0) as u8)));
+        painter.circle_stroke(c, 52.0 + f * 92.0, egui::Stroke::new(1.0_f32, alpha(((1.0 - f) * 80.0) as u8)));
     }
 
     // Sweeping radar line with a short fading trail.
@@ -1469,7 +1517,7 @@ fn loading_overlay(painter: &egui::Painter, rect: egui::Rect, t: f32, name: &str
         let (s, co) = a.sin_cos();
         painter.line_segment(
             [c, c + egui::vec2(co, s) * 118.0],
-            egui::Stroke::new(1.0, alpha((90.0 * (1.0 - k as f32 / 7.0)) as u8)),
+            egui::Stroke::new(1.0_f32, alpha((90.0 * (1.0 - k as f32 / 7.0)) as u8)),
         );
     }
 
@@ -1829,7 +1877,7 @@ fn section(ui: &mut egui::Ui, text: &str) {
     if x1 > x0 + 4.0 {
         ui.painter().line_segment(
             [egui::pos2(x0, y), egui::pos2(x1, y)],
-            egui::Stroke::new(1.0, alpha(22)),
+            egui::Stroke::new(1.0_f32, alpha(22)),
         );
     }
     ui.add_space(3.0);
@@ -1838,7 +1886,7 @@ fn section(ui: &mut egui::Ui, text: &str) {
 /// The container primitive: four L-shaped corner brackets around `rect`. Used in
 /// place of full borders so panels read as a targeting overlay, not a bubble.
 fn brackets(painter: &egui::Painter, rect: egui::Rect, len: f32, color: egui::Color32) {
-    let s = egui::Stroke::new(1.0, color);
+    let s = egui::Stroke::new(1.0_f32, color);
     let seg = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], s);
     let v = egui::vec2;
     let (tl, tr, bl, br) = (
@@ -1874,7 +1922,7 @@ fn band_chip(ui: &mut egui::Ui, c: u8, on: bool, label: &str, size: [f32; 2]) ->
     if !on {
         let r = resp.rect;
         ui.painter()
-            .line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0, col));
+            .line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0_f32, col));
     }
     resp
 }
@@ -1936,7 +1984,7 @@ fn tooltip_glass(band: Option<u8>) -> egui::Frame {
     };
     egui::Frame::none()
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .rounding(egui::Rounding::ZERO)
         .inner_margin(egui::Margin::same(9.0))
 }
@@ -1948,10 +1996,10 @@ fn style_egui(ctx: &egui::Context) {
     v.override_text_color = Some(WHITE);
     // Dropdown menus / popups read as squared dark glass.
     v.window_fill = egui::Color32::from_rgba_unmultiplied(8, 11, 16, 232);
-    v.window_stroke = egui::Stroke::new(1.0, alpha(40));
+    v.window_stroke = egui::Stroke::new(1.0_f32, alpha(40));
     v.window_rounding = egui::Rounding::ZERO;
     v.selection.bg_fill = alpha(30);
-    v.selection.stroke = egui::Stroke::new(1.0, WHITE);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, WHITE);
     // Frameless controls: hairline border on a barely-there fill, all squared,
     // so each widget reads as an etched instrument directly on the scene.
     let strokes = [28u8, 60, 80, 60]; // inactive, hovered, active, open
@@ -1966,7 +2014,7 @@ fn style_egui(ctx: &egui::Context) {
     .enumerate()
     {
         w.rounding = egui::Rounding::ZERO;
-        w.bg_stroke = egui::Stroke::new(1.0, alpha(strokes[i]));
+        w.bg_stroke = egui::Stroke::new(1.0_f32, alpha(strokes[i]));
         w.weak_bg_fill = alpha(fills[i]);
         w.bg_fill = alpha(fills[i]);
     }
@@ -1988,6 +2036,7 @@ fn style_egui(ctx: &egui::Context) {
 
 /// Locate the `test_cases` directory: explicit env var, then the working
 /// directory, then walking up from the executable's location.
+#[cfg(not(target_arch = "wasm32"))]
 fn test_cases_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("BEAM_TEST_CASES") {
         return p.into();
@@ -2021,11 +2070,67 @@ fn reason_idx(r: Reason) -> usize {
     REASONS.iter().position(|&x| x == r).unwrap_or(0)
 }
 
+/// Read a scenario file and solve it (native; `path` is a filesystem path).
+#[cfg(not(target_arch = "wasm32"))]
 fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let scn = io::Scenario::parse(&text).map_err(|e| format!("parse: {e}"))?;
+    build_loaded(&text, algo)
+}
+
+/// Fetch a scenario's text over HTTP (wasm; `url` is relative to the page).
+#[cfg(target_arch = "wasm32")]
+async fn fetch_scenario(url: &str) -> Result<String, String> {
+    let resp = ehttp::fetch_async(ehttp::Request::get(url))
+        .await
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+    if !resp.ok {
+        return Err(format!("fetch {url}: HTTP {}", resp.status));
+    }
+    resp.text()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{url}: response was not valid UTF-8"))
+}
+
+/// Parse + solve scenario text into a [`Loaded`] (platform-independent: no I/O).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // native-only path on wasm
+fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
+    let scn = io::Scenario::parse(text).map_err(|e| format!("parse: {e}"))?;
     let feas = feasibility::build(&scn);
     let trace = trace::run(&scn, &feas, algo);
+    Ok(loaded_from_parts(scn, feas, trace))
+}
+
+// ---- WASM: solve in a Web Worker, off the render thread ---------------------
+// `trace_scenario` (the Worker entry) lives in `crate::wasm` so the threaded
+// solver build — which has no `viz` feature — can also export it.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// JS glue (web/beamer.html): posts `{text, algo}` to the solve Worker and
+    /// resolves with the postcard bytes as a `Uint8Array`.
+    #[wasm_bindgen(js_name = solveText, catch)]
+    async fn solve_text_js(text: &str, algo: u8) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+/// Fetch a scenario URL, solve it in the Worker, and rebuild [`Loaded`].
+#[cfg(target_arch = "wasm32")]
+async fn solve_via_worker(url: &str, algo: u8) -> Result<Loaded, String> {
+    let text = fetch_scenario(url).await?;
+    let bytes = solve_text_js(&text, algo)
+        .await
+        .map_err(|e| format!("solve worker failed: {e:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+    let (scn, feas, trace): (io::Scenario, feasibility::Feasibility, Trace) =
+        postcard::from_bytes(&bytes).map_err(|e| format!("decode solve result: {e}"))?;
+    Ok(loaded_from_parts(scn, feas, trace))
+}
+
+/// Assemble a [`Loaded`] from an already-solved scenario: the GPU-side f32
+/// position/direction caches, the per-satellite event index, and the
+/// unserved-reason counts. Cheap (just maps the data), so it runs on the render
+/// thread even on wasm — where the expensive parse + solve happen in a worker.
+fn loaded_from_parts(scn: io::Scenario, feas: feasibility::Feasibility, trace: Trace) -> Loaded {
     let user_pos: Vec<Vec3> = scn
         .users
         .iter()
@@ -2054,7 +2159,7 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
     for (i, e) in trace.events.iter().enumerate() {
         sat_events[e.sat as usize].push(i as u32);
     }
-    Ok(Loaded {
+    Loaded {
         scn,
         feas,
         user_pos,
@@ -2066,11 +2171,12 @@ fn load_scenario(path: &str, algo: Algorithm) -> Result<Loaded, String> {
         trace,
         sat_events,
         reason_counts,
-    })
+    }
 }
 
 /// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
 /// `--shot` and the `--frames` sequence renderer.
+#[cfg(not(target_arch = "wasm32"))]
 fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2088,6 +2194,7 @@ fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
 /// All scene layers on — the default look for headless stills and sequences.
 /// Interferers stay off here to keep the hero renders clean (their field is a
 /// hover-only overlay anyway).
+#[cfg(not(target_arch = "wasm32"))]
 fn full_view() -> ViewOpts {
     ViewOpts {
         bands: [true; 4],
@@ -2100,6 +2207,7 @@ fn full_view() -> ViewOpts {
 }
 
 /// Copy the scene's offscreen color texture back to the CPU and save it as a PNG.
+#[cfg(not(target_arch = "wasm32"))]
 fn save_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2156,6 +2264,7 @@ fn save_frame(
 
 /// Headless: render one frame of a scenario to a PNG (no window). Used to verify
 /// and preview the renderer. `--shot <scenario.txt> <out.png> [fraction 0..1]`.
+#[cfg(not(target_arch = "wasm32"))]
 fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
     let (w, h) = (1600u32, 1000u32);
     let (device, queue) = init_gpu()?;
@@ -2192,6 +2301,7 @@ fn screenshot(scenario: &str, out: &str, fraction: f64) -> Result<(), String> {
 /// `--frames <scenario.txt> <dir> <n_frames> [orbit_degrees]`: the playback
 /// fraction sweeps 0→1 across the frames while the camera orbits by `orbit_degrees`
 /// total (default 0), so the beam network paints itself onto a slowly turning globe.
+#[cfg(not(target_arch = "wasm32"))]
 fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), String> {
     if n == 0 {
         return Err("n_frames must be > 0".into());
@@ -2229,7 +2339,10 @@ fn frames(scenario: &str, dir: &str, n: usize, orbit_deg: f32) -> Result<(), Str
     Ok(())
 }
 
-fn main() -> eframe::Result<()> {
+/// Native entry point: parse CLI args (`--shot` / `--frames` headless modes) and
+/// otherwise launch the interactive window. Called by the thin `beamer` binary.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s == "--shot").unwrap_or(false) {
         let scenario = args
@@ -2275,3 +2388,78 @@ fn main() -> eframe::Result<()> {
     };
     eframe::run_native("Beamer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
+
+/// Browser entry point: mount the visualizer onto a `<canvas>`. Called from JS
+/// once the wasm module is initialized. Async because eframe brings the GPU
+/// surface up asynchronously. The `App::new` closure is identical to native.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
+    // Force the WebGL2 backend. wgpu 22 requests the `maxInterStageShaderComponents`
+    // device limit, which current browsers removed from the WebGPU spec, so the
+    // WebGPU `requestDevice` path is rejected. WebGL2 skips that negotiation.
+    // (Revisit once eframe/wgpu are on wgpu >= 23, where the limit is gone.)
+    let web_options = eframe::WebOptions {
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            supported_backends: wgpu::Backends::GL,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    eframe::WebRunner::new()
+        .start(canvas, web_options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The viz solve Worker serializes (Scenario, Feasibility, Trace) with postcard
+    // and the render thread deserializes it. Exercise that round-trip natively so
+    // the cross-Worker handoff can't silently drift.
+    #[test]
+    fn solve_roundtrip_postcard() {
+        let text = include_str!("../../test_cases/03_five_users.txt");
+        let scn = io::Scenario::parse(text).unwrap();
+        let feas = feasibility::build(&scn);
+        let trace = trace::run(&scn, &feas, Algorithm::Optimized);
+        let (n_users, n_sats, n_events, n_ids) =
+            (scn.users.len(), scn.sats.len(), trace.events.len(), scn.user_ids.len());
+
+        let bytes = postcard::to_allocvec(&(&scn, &feas, &trace)).unwrap();
+        let (scn2, feas2, trace2): (io::Scenario, feasibility::Feasibility, Trace) =
+            postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(scn2.users.len(), n_users);
+        assert_eq!(scn2.user_ids.len(), n_ids);
+        assert_eq!(feas2.feasible_users, feas.feasible_users);
+        assert_eq!(trace2.events.len(), n_events);
+
+        // The deserialized parts must rebuild a Loaded with consistent caches.
+        let l = loaded_from_parts(scn2, feas2, trace2);
+        assert_eq!(l.sat_pos.len(), n_sats);
+        assert_eq!(l.sat_events.len(), n_sats);
+    }
+}
+
+// ---- WASM: the visualizer app's wasm-bindgen bindings -----------------------
+
+/// Solve a scenario for the visualizer and return `(Scenario, Feasibility, Trace)`
+/// postcard-serialized; the render thread deserializes and rebuilds its state.
+/// `algo` indexes [`beamer::trace::Algorithm::ALL`]. In the multi-thread
+/// build this runs the rayon Worker pool — call `initThreadPool` first.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn trace_scenario(text: &str, algo: u8) -> Result<Vec<u8>, wasm_bindgen::JsError> {
+    let algo = Algorithm::ALL.get(algo as usize).copied().unwrap_or(Algorithm::Optimized);
+    let scn = io::Scenario::parse(text).map_err(|e| wasm_bindgen::JsError::new(&e))?;
+    let feas = feasibility::build(&scn);
+    let tr = trace::run(&scn, &feas, algo);
+    postcard::to_allocvec(&(scn, feas, tr)).map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))
+}
+
+/// `wasm-bindgen-rayon`'s `initThreadPool`; call once after `init()` with the
+/// worker count. Only present in the multi-thread build (the `parallel` feature).
+#[cfg(all(target_arch = "wasm32", feature = "parallel"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
