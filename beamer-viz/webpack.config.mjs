@@ -23,6 +23,9 @@ export default {
     new CopyPlugin({
       patterns: [
         '../coi-serviceworker.js',
+        // `npm run serve` reads its COOP/COEP header config from the served dir;
+        // ship serve.json into dist/ so `serve dist` finds it (a no-op on Pages).
+        'serve.json',
         { from: '../test_cases', to: 'test_cases' }
       ]
     })
