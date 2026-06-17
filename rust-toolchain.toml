@@ -1,0 +1,8 @@
+# The threaded WASM build needs nightly (for `-Z build-std`) + rust-src + the
+# wasm target. Pinning here means `cargo build` / CI / agents all agree, and the
+# native crates simply build on nightly too (no nightly features are used).
+# Pin a dated channel (e.g. "nightly-2025-11-15") if you want byte-reproducibility.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["wasm32-unknown-unknown"]

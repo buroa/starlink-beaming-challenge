@@ -1,7 +1,9 @@
 name: Deploy to GitHub Pages
 
-# Builds both WASM modules (serial viz render + threaded solver) and publishes
-# the assembled site: the visualizer at `/`, the solver harness at `/solver`.
+# Builds both webpack apps (wasm-pack single + multi-thread → webpack) and
+# publishes the assembled site: the visualizer at `/`, the solver at `/solver`.
+# coi-serviceworker.js (bundled into each app) supplies the COOP/COEP isolation
+# Pages can't set via headers, so the threaded builds light up.
 #
 # One-time setup: repo Settings → Pages → Build and deployment → Source =
 # "GitHub Actions".
@@ -27,32 +29,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Stable builds the serial viz render module; nightly + rust-src builds the
-      # threaded solver with -Z build-std (atomics / shared memory).
-      - name: Install Rust toolchains
-        run: |
-          rustup toolchain install stable  --profile minimal --target wasm32-unknown-unknown
-          rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
+      # rust-toolchain.toml pins nightly + rust-src + the wasm target; this just
+      # ensures it's installed. wasm-pack (an npm devDependency) drives the build;
+      # the threaded -Z build-std + atomics rustflags come from each app's
+      # package.json + .cargo/config.toml.
+      - name: Install Rust (nightly + rust-src + wasm target)
+        run: rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
 
-      - name: Cache cargo + target
-        uses: actions/cache@v4
+      - uses: actions/setup-node@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-wasm-
+          node-version: 22
 
-      # Builds both wasm modules and assembles web/dist. wasm-bindgen runs as a
-      # library inside xtask, so there's no separate CLI to install.
-      - name: Build WASM + assemble site
-        run: cargo xtask dist
+      # Each app: npm ci installs webpack + wasm-pack, then `build` runs
+      # wasm-pack (st + mt) and webpack. wasm-pack resolves the rayon worker, so
+      # there's no post-build JS patching.
+      - name: Build the solver app
+        run: cd beamer && npm ci && npm run build
+      - name: Build the visualizer app
+        run: cd beamer-viz && npm ci && npm run build
+
+      # Assemble the site: the visualizer at `/`, the solver at `/solver`. Each
+      # app's dist is self-contained (its own pkg, coi-serviceworker, test_cases).
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -r beamer-viz/dist/. _site/
+          cp -r beamer/dist _site/solver
+          touch _site/.nojekyll
 
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: web/dist
+          path: _site
 
   deploy:
     needs: build

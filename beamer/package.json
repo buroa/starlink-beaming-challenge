@@ -1,0 +1,22 @@
+{
+  "private": true,
+  "scripts": {
+    "build:wasm-st": "cross-env RUSTFLAGS= wasm-pack build --target web -- --no-default-features --features app",
+    "build:wasm-mt": "wasm-pack build --target web --out-dir pkg-parallel -- --no-default-features --features app,parallel -Z build-std=panic_abort,std",
+    "build:wasm": "run-p build:wasm-st build:wasm-mt",
+    "build": "npm run build:wasm && webpack build",
+    "serve": "npm run build && serve dist --config serve.json"
+  },
+  "devDependencies": {
+    "copy-webpack-plugin": "^12.0.2",
+    "cross-env": "7.0.3",
+    "npm-run-all": "4.1.5",
+    "serve": "^14.2.4",
+    "wasm-pack": "0.13.1",
+    "webpack": "5.97.1",
+    "webpack-cli": "6.0.1"
+  },
+  "dependencies": {
+    "wasm-feature-detect": "1.8.0"
+  }
+}

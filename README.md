@@ -36,18 +36,15 @@ Needs a recent Rust toolchain (and `python3` only for the official validator).
 cargo build --release
 
 # Solve one scenario; the solution (+ a certificate header) goes to stdout.
-./target/release/beam-planner test_cases/09_ten_thousand_users.txt
+./target/release/beamer test_cases/09_ten_thousand_users.txt
 
 # Maximum-coverage mode: spend seconds of intensive search to recover the last
 # few users on the hardest component (default is the ~sub-second solve).
-./target/release/beam-planner test_cases/11_one_hundred_thousand_users.txt --max
-
-# Solve and validate every test case through the official evaluate.py.
-./run.sh
+./target/release/beamer test_cases/11_one_hundred_thousand_users.txt --max
 ```
 
-The workspace builds two binaries: **`beam-planner`** (the solver) and
-**`beamer`** (the visualizer — see below).
+The workspace builds two binaries: **`beamer`** (the solver) and
+**`beamer-viz`** (the visualizer — see below).
 
 ## Results
 
@@ -141,137 +138,97 @@ expensive way.
 
 ## WebAssembly
 
-The solver core compiles to a browser-ready `wasm-bindgen` module — the same
-production code, exposed as one entry point:
+Both the production solver **and** the GPU visualizer run in the browser, as two
+self-contained WebAssembly apps modeled on the [wasm-bindgen-rayon
+demo](https://github.com/RReverser/wasm-bindgen-rayon/tree/main/demo).
 
-```js
-import init, { solve_scenario, initThreadPool } from './pkg/beam_planner.js';
-await init();
-await initThreadPool(navigator.hardwareConcurrency); // threaded build only
-const solution = solve_scenario(scenarioText, /* intense = */ false);
-// For the threaded build, run these inside a Web Worker — see the note below.
-```
+A Cargo **workspace**, two crates:
 
-Two Cargo features gate this. `viz` (default) pulls in the visualizer's
-native-only stack (eframe/wgpu/ureq/…); `--no-default-features` drops it to the
-headless solver + library. `parallel` (default) is rayon — a work-stealing
-OS-thread pool natively, or rayon-on-Web-Workers in the browser via
-`wasm-bindgen-rayon`. The solver is deterministic, so the serial and parallel
-builds produce **bit-identical** solutions (verified by diffing the CLI output of
-both builds on cases 09 and 11).
+- **[`beamer/`](beamer/)** — the **solver**: the `beamer` core library (parsing,
+  geometry, feasibility, bounds, assignment, trace), the native `beamer` CLI
+  ([`bin/main.rs`](beamer/bin/main.rs)), and the browser **solver app** — a
+  wasm-bindgen loader ([`src/app.rs`](beamer/src/app.rs)) exporting `solve_scenario`
+  + `initThreadPool`, with a webpack front-end.
+- **[`beamer-viz/`](beamer-viz/)** — **Beamer**, the visualizer: the rendering
+  library, the native `beamer-viz` desktop GUI, and the browser **visualizer app**
+  exporting `start` (mount eframe on a `<canvas>`) + `trace_scenario` +
+  `initThreadPool`. Depends on `beamer` for the core. The solver is deterministic,
+  so serial and parallel builds produce **bit-identical** solutions.
 
-A ready-to-run harness lives in [`web/`](web/): the **visualizer** at `/` and a
-one-button **solver** at `/solver`. An [`xtask`](xtask/) — the Rust replacement
-for build scripts — builds both WASM modules and assembles the deployable site;
-wasm-bindgen runs as a library inside it, so there's nothing external to install:
-
-```sh
-cargo xtask dist                           # build both modules → web/dist/
-(cd web/dist && python3 -m http.server)    # → http://localhost:8000/  (and /solver)
-```
-
-(`cargo xtask viz` and `cargo xtask solver` build the individual modules.)
-
-The threaded builds need [cross-origin isolation](https://web.dev/articles/coop-coep)
-(for `SharedArrayBuffer`), which static hosts like GitHub Pages can't grant via
-headers — so [`web/coi-serviceworker.js`](web/coi-serviceworker.js) supplies it
-with a service worker (the harnesses fall back to a serial solve if it's
-unavailable). A GitHub Actions workflow ([`.github/workflows/pages.yml`](.github/workflows/pages.yml))
-builds both modules and publishes the site to **GitHub Pages** on every push to
-`main` — one-time setup: repo *Settings → Pages → Source → "GitHub Actions"*.
-
-The visualizer page wants **both** `--viz` (the render module) and `--threaded`
-(the parallel solve module its Worker prefers); with only `--viz` it still works,
-solving serially in the Worker.
-
-The serial build is a one-liner on stable; the threaded build is fussier, because
-this toolchain's `wasm-ld` does *not* derive the threading setup from `+atomics`
-alone. The memory and TLS globals have to be requested explicitly — an
-**imported, shared, bounded** memory (what wasm-bindgen's thread transform
-expects) plus the `__heap_base`/TLS exports it injects into:
+**Build — webpack, like the demo.** Each app is an npm project (`index.html` /
+`index.js` / `package.json` / `serve.json` / `webpack.config.mjs`). `npm run build`
+compiles the wasm **twice** with wasm-pack — a single-thread `pkg/` and a
+multi-thread `pkg-parallel/` — then webpack bundles `index.js`, which feature-detects
+threads with [`wasm-feature-detect`](https://github.com/GoogleChromeLabs/wasm-feature-detect)
+and loads the matching one:
 
 ```sh
-# Serial:
-cargo build --release --lib --no-default-features --target wasm32-unknown-unknown
-wasm-bindgen target/wasm32-unknown-unknown/release/beam_planner.wasm --target web --out-dir web/pkg
-
-# Threaded:
-RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals \
-  -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=2147483648 \
-  -C link-arg=--export=__heap_base \
-  -C link-arg=--export-if-defined=__wasm_init_tls \
-  -C link-arg=--export-if-defined=__tls_size \
-  -C link-arg=--export-if-defined=__tls_align \
-  -C link-arg=--export-if-defined=__tls_base' \
-  cargo +nightly build --release --lib --no-default-features --features parallel \
-  --target wasm32-unknown-unknown -Z build-std=std,panic_abort
-wasm-bindgen target/wasm32-unknown-unknown/release/beam_planner.wasm --target web --out-dir web/pkg
+cd beamer      && npm install && npm run serve   # the solver app
+cd beamer-viz  && npm install && npm run serve   # the visualizer app
 ```
 
-`std::time::Instant` (used for the solver's repair deadlines) panics on
-`wasm32-unknown-unknown`, so the library uses [`web-time`](https://crates.io/crates/web-time),
-an API-identical drop-in that is a zero-cost std re-export off-wasm. The threaded
-build's `SharedArrayBuffer` requires the page to be **cross-origin isolated**
-(`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
-require-corp`). Hosts that can set headers can do so directly; `coi-serviceworker.js`
-injects them otherwise (and re-serves the cross-origin basemap tiles — which send
-`Access-Control-Allow-Origin: *` — as `Cross-Origin-Resource-Policy: cross-origin`
-so they survive the policy). The serial build needs none of this.
+The threaded build needs nightly + `-Z build-std` + atomics/shared-memory flags.
+Those flags live in each app's [`.cargo/config.toml`](beamer/.cargo/config.toml)
+(scoped to `[target.wasm32-unknown-unknown]`); the single-thread `build:wasm-st`
+script clears `RUSTFLAGS` (`cross-env RUSTFLAGS=`) to opt out and link the plain,
+non-atomics std. (cargo can't scope rustflags per cargo-feature, so config-plus-opt-out
+is the clean equivalent — no long flag lists in `package.json`.) Nightly + rust-src +
+the wasm target are pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 
-**Run the parallel solve in a Worker, not on the main thread.** rayon blocks the
-calling thread until its pool finishes, and the browser main thread is forbidden
-from blocking (`Atomics.wait` throws there) — so a threaded solve invoked on the
-main thread *deadlocks*. The harness runs it in
-[`web/solver-worker.js`](web/solver-worker.js), which also keeps the UI responsive
-during the slower serial solve. (One more static-host wrinkle: wasm-bindgen-rayon's
-worker bootstrap imports the main module as a bare directory, which only resolves
-through a bundler — `xtask` rewrites it to the explicit file so it works when
-served as plain files.)
+**Webpack resolves the worker — no JS patching.** wasm-bindgen-rayon spawns its rayon
+pool as Web Workers via `new Worker(new URL('./workerHelpers.js', import.meta.url))`;
+webpack bundles that worker (and its nested workers) natively, so unlike a plain
+static host there's nothing to hand-patch.
 
-Threading only wins where there's real parallelism to exploit. Measured in-browser
-on 16 hardware threads (`solve_scenario` wall time, all three matching the CLI's
-coverage exactly):
+**Cross-origin isolation.** `SharedArrayBuffer` (hence wasm threads) needs the page
+[cross-origin isolated](https://web.dev/articles/coop-coep) (`Cross-Origin-Opener-Policy:
+same-origin` + `Cross-Origin-Embedder-Policy: require-corp`). Locally, `npm run serve`
+runs `serve --config serve.json`, which sets those headers. On **GitHub Pages** —
+which can't set headers — [`coi-serviceworker.js`](coi-serviceworker.js), bundled into
+each app, registers a service worker that injects them (and re-serves the cross-origin
+basemap tiles as `Cross-Origin-Resource-Policy: cross-origin` so they survive).
+`std::time::Instant` panics on wasm, so the solver uses
+[`web-time`](https://crates.io/crates/web-time), an API-identical drop-in.
+
+**Threading.** The solver app calls `solve_scenario` on the **main thread** — rayon's
+Web Worker pool does the parallel work, so it doesn't block. The visualizer instead
+hands `trace_scenario` to a dedicated worker ([`beamer-viz/solve.worker.js`](beamer-viz/solve.worker.js))
+so the solve never stalls the render loop; it returns `(Scenario, Feasibility, Trace)`
+postcard-serialized for the render thread to rebuild. Measured in-browser on 16
+hardware threads (`solve_scenario` wall time, matching the CLI's coverage exactly):
 
 | Case | Serial | Threaded (16 workers) |
 |---|---|---|
 | `03` · 5 users | 4 ms | 15 ms |
-| `09` · 10k users | 2.5 s | 4.3 s |
+| `09` · 10k users | 2.5 s | **0.38 s** |
 | `11` · 100k users | 31.7 s | **12.0 s** |
 
-The 100k case splits into thousands of independent components, so it parallelizes
-~2.6×; the small cases are dominated by per-op atomic overhead and run faster
-serial. Reach for the threaded build when the 100k-class solve time matters;
-otherwise serial is simpler and needs no special headers.
+The 10k and 100k cases split into thousands of independent components and parallelize
+well (~6× and ~2.6×); the tiny 5-user case is dominated by per-op atomic overhead and
+runs faster serial — which is also the fallback when a browser isn't cross-origin
+isolated.
 
-**The visualizer runs in the browser too.** `cargo xtask viz` compiles the whole
-eframe/egui/wgpu app to wasm, and [`web/index.html`](web/index.html) mounts it on a
-`<canvas>` via eframe's `WebRunner` — the globe, live nebula, the full HUD, and any
-of the 12 scenarios fetched on demand. The solve runs **in a Web Worker**
-([`web/viz-solver-worker.js`](web/viz-solver-worker.js)) so the canvas keeps animating
-throughout — and it's **parallel**: the worker prefers the threaded solver module
-(`cargo xtask solver`), bringing up the same 16-way `wasm-bindgen-rayon` pool
-the solver harness uses (10k solves in ~0.4 s vs ~2.5 s serial), and falls back to
-the serial module if the threaded build or cross-origin isolation isn't available.
-It returns `(Scenario, Feasibility, Trace)` postcard-serialized; the render thread
-rebuilds its state. So even the 100k case never freezes. It renders through **WebGL2**: eframe 0.29 ships wgpu 22,
-whose WebGPU path requests a device limit (`maxInterStageShaderComponents`) that
-current browsers removed, so the entry forces `Backends::GL` and the build enables
-wgpu's `webgl` feature. The viz `[[bin]]` moved into the library (`src/viz/`) so
-wasm-bindgen can emit it; native and headless modes are
-`#[cfg(not(target_arch = "wasm32"))]`-gated. **Live basemap tiles** stream too: the
-native streamer's 8-thread + `ureq` model is ported to per-tile async `fetch` on
-wasm (keeping the quadtree refinement, LRU cache, and `image` decode — only the
-execution model changes), and the web build defaults the basemap on. The
-visualizer now runs at **full parity in the browser** — render, all 12 scenarios,
-the parallel solve, and live tiles.
+**Deploy.** A GitHub Actions workflow ([`.github/workflows/pages.yml`](.github/workflows/pages.yml))
+`npm run build`s both apps and publishes the assembled site to **GitHub Pages** on
+every push to `main` — the visualizer at `/`, the solver at `/solver`, each app's
+`dist/` self-contained (its own `pkg`, `coi-serviceworker.js`, scenarios). One-time
+setup: repo *Settings → Pages → Source → "GitHub Actions"*.
+
+**The visualizer renders through WebGL2**: eframe 0.29 ships wgpu 22, whose WebGPU
+path requests a device limit (`maxInterStageShaderComponents`) current browsers
+removed, so [`start`](beamer-viz/src/lib.rs) forces `Backends::GL` and the build
+enables wgpu's `webgl` feature. **Live basemap tiles** stream via per-tile async
+`fetch` on wasm (the native streamer's threads + `ureq` model, keeping the quadtree
+refinement, LRU cache, and `image` decode). The visualizer runs at **full parity in
+the browser** — render, all 12 scenarios, the parallel solve, and live tiles.
 
 ## Visualizer — Beamer
 
-`beamer` is a GPU-rendered, interactive 3D globe built straight into the app
+`beamer-viz` is a GPU-rendered, interactive 3D globe built straight into the app
 (wgpu + egui) — no browser, no external tooling.
 
 ```sh
-cargo run --release --bin beamer
+cargo run --release --bin beamer-viz
 ```
 
 It opens fullscreen, framed on the United States, on the 100k-user case (`11`),

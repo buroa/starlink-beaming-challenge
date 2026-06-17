@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Beamer · WebAssembly</title>
+<!-- Cross-origin isolation (wasm threads) on hosts without COOP/COEP headers,
+     e.g. GitHub Pages. Reloads once on first visit. Classic script (not module). -->
+<script src="coi-serviceworker.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #06090d; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #msg {
+    position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    color: #7d8893; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .15em; text-transform: uppercase; text-align: center; padding: 2rem;
+  }
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="msg">loading beamer…</div>
+  <script src="index.js"></script>
+</body>
+</html>
