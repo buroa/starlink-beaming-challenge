@@ -1,32 +1,25 @@
-# The solver: the `solver` core library (the beam-planning algorithm), the native
-# `beamer` CLI (bin/main.rs), and the browser solver app (src/app.rs, the
-# wasm-bindgen loader). The `viz` crate depends on this one for the core.
-# Built for the web with wasm-pack — see package.json / webpack.config.mjs.
+# The solver: the `beamer` core library (the beam-planning algorithm) and the
+# native `beamer` CLI (bin/main.rs). The `beamer-viz` crate depends on this one
+# for the core — and is the single browser front end (it embeds the solver).
 [package]
 name = "beamer"
 version.workspace = true
 edition.workspace = true
-description = "Starlink beam-planning solver: core library + CLI + browser WASM app."
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+description = "Starlink beam-planning solver: core library + CLI."
 
 [[bin]]
 name = "beamer"
 path = "bin/main.rs"
 
 [features]
-default = ["app", "parallel"]
-# Multicore solving: rayon's pool natively, or — on wasm, with the `app` loader —
-# wasm-bindgen-rayon's Web Worker pool. The single-thread build omits this and
-# rayon falls back to serial.
-parallel = ["dep:rayon", "dep:wasm-bindgen-rayon"]
-# serde derives on the solve output (Scenario, Feasibility, Trace) so the `viz`
-# crate can postcard them across its Web Worker boundary.
+default = ["parallel"]
+# Multicore solving: rayon's work-stealing pool. The single-thread build omits
+# this and the solver's `par` shim falls back to sequential iterators (e.g. for a
+# no-atomics wasm build of a dependent crate).
+parallel = ["dep:rayon"]
+# serde derives on the solve output (Scenario, Feasibility, Trace) so the
+# `beamer-viz` crate can postcard them across its Web Worker boundary.
 wire = ["dep:serde"]
-# The browser solver app's wasm-bindgen loader (`solve_scenario`). Off when this
-# crate is used purely as a library (e.g. by `viz`), so its bindings don't leak.
-app = ["dep:wasm-bindgen"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
@@ -35,7 +28,3 @@ arrayvec = "0.7"
 # drop-in (a zero-cost std re-export off-wasm, Performance.now()-backed on wasm).
 web-time.workspace = true
 serde = { version = "1", features = ["derive"], optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { workspace = true, optional = true }
-wasm-bindgen-rayon = { workspace = true, optional = true }

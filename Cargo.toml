@@ -1,11 +1,11 @@
-# Virtual workspace. Two self-contained crates:
+# Virtual workspace. Two crates:
 #
-#   beamer/         the beam-planning solver — core library + `beamer` CLI +
-#                   the browser solver app (wasm).
-#   beamer-viz/     Beamer — the GPU visualizer — rendering library + `beamer-viz` desktop
-#                   GUI + the browser visualizer app (wasm). Depends on `beamer`.
+#   beamer/         the beam-planning solver — core library + `beamer` CLI.
+#   beamer-viz/     Beamer — the GPU visualizer — rendering library + `beamer-viz`
+#                   desktop GUI + the browser app (wasm), which embeds the solver
+#                   so the visualizer is the single web front end. Depends on `beamer`.
 #
-# Each builds for the web with wasm-pack (see its package.json / webpack.config.mjs).
+# beamer-viz builds for the web with wasm-pack (see its package.json / webpack.config.mjs).
 [workspace]
 members = ["beamer", "beamer-viz"]
 resolver = "2"

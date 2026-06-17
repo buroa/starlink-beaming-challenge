@@ -3,7 +3,8 @@
 //! With the `parallel` feature (default) this re-exports rayon's prelude, so the
 //! `par_iter` / `into_par_iter` call sites in [`crate::assign`] and
 //! [`crate::feasibility`] run on rayon's work-stealing pool — OS threads
-//! natively, or Web Workers in the browser when built with `wasm-bindgen-rayon`.
+//! natively, or, in the browser, whatever pool the embedding crate installs (the
+//! visualizer wires up wasm-bindgen-rayon's Web Worker pool).
 //!
 //! Without the feature the *same* call sites resolve to sequential iterators, so
 //! the solver compiles with no thread/atomics requirement (e.g. stable

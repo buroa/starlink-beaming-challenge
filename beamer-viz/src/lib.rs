@@ -78,6 +78,9 @@ struct Loaded {
     /// Lets focus mode extract one satellite's ≤32 beams without rescanning all
     /// ~100k events every frame.
     sat_events: Vec<Vec<u32>>,
+    /// Event index per user (`-1` if never served). Each user gets at most one
+    /// beam, so the hover tooltip resolves served/pending in O(1).
+    user_event: Vec<i32>,
     /// Reason counts, in the order of `Reason` variants used below.
     reason_counts: [usize; 4],
 }
@@ -126,10 +129,9 @@ enum Picked {
 const FOCUS_INTERFERER_COS: f32 = 0.906_307_8; // cos(25°)
 
 /// Build the GPU point + beam lists for the first `revealed_f` beams. Shared by
-/// the live UI and the headless screenshot.
-///
-/// Allocates point and beam vectors with capacity hints to minimize reallocations
-/// in the hot frame-loop (up to 100k users × 1440 satellites in worst case).
+/// the live UI and the headless screenshot. Clears and refills the caller's
+/// reusable [`ComposeBuffers`], so the hot frame-loop never reallocates (up to
+/// 100k users × 1440 satellites in the worst case).
 fn compose(
     l: &Loaded,
     revealed_f: f64,
@@ -262,6 +264,10 @@ fn compose(
 const INTERFERER_RGBA: [f32; 4] = [0.85, 0.35, 1.0, 0.95];
 /// The same magenta as readable UI text (for interferer labels/warnings).
 const INTERFERER_UI: egui::Color32 = egui::Color32::from_rgb(217, 140, 255);
+/// The interferer magenta at a given alpha (the GPU's four-channel array).
+fn interferer_rgba(a: f32) -> [f32; 4] {
+    [INTERFERER_RGBA[0], INTERFERER_RGBA[1], INTERFERER_RGBA[2], a]
+}
 
 /// Draw one interferer's 20° field of interference as a "bullseye" footprint on
 /// the globe directly beneath it — a bold ring at 20° geocentric radius around
@@ -281,19 +287,18 @@ fn push_interference_field(points: &mut Vec<PointInstance>, beams: &mut Vec<Beam
     let u = axis.cross(seed).normalize();
     let v = axis.cross(u);
     let (sin20, cos20) = 20f32.to_radians().sin_cos();
-    let purple = |a: f32| [INTERFERER_RGBA[0], INTERFERER_RGBA[1], INTERFERER_RGBA[2], a];
 
     let sub = axis * R; // sub-interferer point on the surface
     // Axis line out to the interferer, and a marker at the footprint centre.
     beams.push(BeamInstance {
         a: sub.to_array(),
         b: ip.to_array(),
-        color: purple(0.5),
+        color: interferer_rgba(0.5),
     });
     points.push(PointInstance {
         pos: sub.to_array(),
         size: 11.0,
-        color: purple(0.95),
+        color: interferer_rgba(0.95),
     });
 
     const N: usize = 64;
@@ -307,7 +312,7 @@ fn push_interference_field(points: &mut Vec<PointInstance>, beams: &mut Vec<Beam
             beams.push(BeamInstance {
                 a: sub.to_array(),
                 b: rim,
-                color: purple(0.18),
+                color: interferer_rgba(0.18),
             });
         }
         // The bold exclusion ring.
@@ -315,7 +320,7 @@ fn push_interference_field(points: &mut Vec<PointInstance>, beams: &mut Vec<Beam
             beams.push(BeamInstance {
                 a: p,
                 b: rim,
-                color: purple(0.7),
+                color: interferer_rgba(0.7),
             });
         }
         prev = Some(rim);
@@ -461,9 +466,8 @@ fn compose_focus_flat(
         horiz = if horiz.length() > 1e-4 { horiz.normalize() } else { Vec3::X };
         let foot_g = ground(horiz.x * ext * 0.55, horiz.y * ext * 0.55);
         let marker = foot_g + Vec3::new(0.0, 0.0, lay.sat_h * 1.4);
-        let mag = |a: f32| [INTERFERER_RGBA[0], INTERFERER_RGBA[1], INTERFERER_RGBA[2], a];
-        buf.beams.push(BeamInstance { a: marker.to_array(), b: foot_g.to_array(), color: mag(0.45) });
-        buf.points.push(PointInstance { pos: marker.to_array(), size: 11.0, color: mag(0.95) });
+        buf.beams.push(BeamInstance { a: marker.to_array(), b: foot_g.to_array(), color: interferer_rgba(0.45) });
+        buf.points.push(PointInstance { pos: marker.to_array(), size: 11.0, color: interferer_rgba(0.95) });
         push_ring_xy(&mut buf.beams, foot_g, foot * 0.7, 0.5);
     }
 }
@@ -528,17 +532,28 @@ fn push_flat_reticle(beams: &mut Vec<BeamInstance>, c: Vec3, t: f32) {
 
 struct App {
     scene: Scene,
-    device: Arc<wgpu::Device>,
+    device: wgpu::Device,
     renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
     texture_id: egui::TextureId,
 
     scenarios: Vec<(String, String)>, // (label, path)
     current: usize,
+    /// "Add your own…" mode: solve `custom_text` (an uploaded / dropped scenario)
+    /// instead of a bundled one. Lets the viz double as the solver front end.
+    custom: bool,
+    custom_text: String,
+    /// Collapsed (minimized to their header) states for the two glass panels, so a
+    /// small / mobile screen can reclaim the space. Toggled by tapping the header.
+    left_collapsed: bool,
+    unserved_collapsed: bool,
     algo: Algorithm,
     loaded: Option<Loaded>,
     /// In-flight background solve (the production solver is too heavy to run on
     /// the UI thread — it would freeze the window for seconds).
     loading: Option<std::sync::mpsc::Receiver<Result<Loaded, String>>>,
+    /// Text from an in-flight file-picker upload (wasm), delivered to the UI thread
+    /// like `loading`. Drag-and-drop is handled inline in `update()` instead.
+    upload_rx: Option<std::sync::mpsc::Receiver<String>>,
     error: Option<String>,
 
     camera: OrbitCamera,
@@ -629,7 +644,7 @@ impl App {
             s
         };
         // WASM has no filesystem: the second tuple field is a URL (relative to
-        // web/beamer.html), fetched on demand by `load()`.
+        // the page), fetched on demand by `load()`.
         #[cfg(target_arch = "wasm32")]
         let scenarios: Vec<(String, String)> = [
             "00_example", "01_simplest_possible", "02_two_users", "03_five_users",
@@ -648,9 +663,14 @@ impl App {
             texture_id,
             scenarios,
             current: 0,
+            custom: false,
+            custom_text: String::new(),
+            left_collapsed: false,
+            unserved_collapsed: false,
             algo: Algorithm::Optimized,
             loaded: None,
             loading: None,
+            upload_rx: None,
             error: None,
             camera: OrbitCamera::default(),
             revealed: 0.0,
@@ -679,21 +699,10 @@ impl App {
             last_pick: None,
         };
         style_egui(&cc.egui_ctx);
-        // On the web, default the basemap on to show off the live tile streaming
-        // (Off — the transparent globe over the nebula — is one click away in the
-        // Basemap picker).
-        #[cfg(target_arch = "wasm32")]
-        {
-            app.tile_source = tiles::TileSource::Dark;
-            app.scene.set_tile_source(tiles::TileSource::Dark);
-        }
-        // Native opens on the headline 100k case; wasm solves inline (for now), so
-        // default to a fast, globe-filling scenario instead.
-        #[cfg(not(target_arch = "wasm32"))]
-        let default_prefix = "11";
-        #[cfg(target_arch = "wasm32")]
-        let default_prefix = "09";
-        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with(default_prefix)) {
+        // Open on the headline 100k case with the basemap off, so the beam network
+        // paints onto the transparent globe over the nebula — the prettiest first
+        // look. A basemap (Dark / Light / Satellite) is one click away in GLOBE.
+        if let Some(i) = app.scenarios.iter().position(|(l, _)| l.starts_with("11")) {
             app.current = i;
         }
         app.load();
@@ -723,12 +732,39 @@ impl App {
         // Invalidate per-frame caches keyed by the old scenario.
         self.last_compose_key = None;
         self.last_pick = None;
+        let algo = self.algo;
+
+        // "Add your own…": solve the pasted text directly (no fetch / no file).
+        if self.custom {
+            let text = self.custom_text.clone();
+            if text.trim().is_empty() {
+                self.loading = None;
+                return;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(build_loaded(&text, algo));
+                });
+                self.loading = Some(rx);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.loading = Some(rx);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(solve_text_via_worker(&text, algo).await);
+                });
+            }
+            return;
+        }
+
         let Some((_, src)) = self.scenarios.get(self.current).cloned() else {
             self.error = Some("No scenarios found in ./test_cases".into());
             self.loading = None;
             return;
         };
-        let algo = self.algo;
         // Native: solve on a background thread (`src` is a path), polled in
         // update() so the 100k case never freezes the window.
         #[cfg(not(target_arch = "wasm32"))]
@@ -748,17 +784,75 @@ impl App {
         {
             let (tx, rx) = std::sync::mpsc::channel();
             self.loading = Some(rx);
-            let algo_idx = Algorithm::ALL.iter().position(|&a| a == algo).unwrap_or(0) as u8;
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = tx.send(solve_via_worker(&src, algo_idx).await);
+                let _ = tx.send(solve_via_worker(&src, algo).await);
             });
         }
     }
 
-    /// Re-solve (e.g. after an algorithm change). Re-parsing is cheap; the solve
-    /// is the cost, so it goes through the same background path as `load`.
-    fn rerun(&mut self) {
+    /// Export the current solution in validator format. On wasm this triggers a
+    /// browser download; natively it writes a `<scenario>.solution.txt` in the cwd.
+    fn download_solution(&mut self) {
+        let Some(l) = &self.loaded else { return };
+        let text = match solution_text(l) {
+            Ok(t) => t,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let name = if self.custom {
+            "custom".to_string()
+        } else {
+            self.scenarios
+                .get(self.current)
+                .map(|s| s.0.clone())
+                .unwrap_or_else(|| "scenario".into())
+        };
+        let filename = format!("{name}.solution.txt");
+        #[cfg(target_arch = "wasm32")]
+        download_text_js(&filename, &text);
+        #[cfg(not(target_arch = "wasm32"))]
+        match std::fs::write(&filename, &text) {
+            Ok(()) => eprintln!("wrote {filename}"),
+            Err(e) => self.error = Some(format!("write {filename}: {e}")),
+        }
+    }
+
+    /// Solve an uploaded / dropped scenario: switch to "Add your own…" mode, store
+    /// the text, and kick off the background solve (which clears the prior render).
+    fn ingest_scenario(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.custom = true;
+        self.custom_text = text;
+        self.exit_focus();
         self.load();
+    }
+
+    /// Leave "Add your own…" (via Esc or a click off the dialog) and restore the
+    /// previously-selected bundled scenario. The pasted draft is kept so reopening
+    /// the dialog doesn't lose it.
+    fn exit_custom(&mut self) {
+        self.custom = false;
+        self.error = None;
+        self.load();
+    }
+
+    /// Open the browser file picker; the chosen file's text arrives via `upload_rx`,
+    /// polled in `update()`. (Native uses drag-and-drop instead.)
+    #[cfg(target_arch = "wasm32")]
+    fn open_file_picker(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.upload_rx = Some(rx);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(v) = pick_scenario_js().await {
+                if let Some(s) = v.as_string() {
+                    let _ = tx.send(s);
+                }
+            }
+        });
     }
 
     fn total_events(&self) -> usize {
@@ -768,8 +862,16 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Hit-test satellites/terminals under the cursor (front hemisphere only),
-    /// returning a tooltip title + detail lines.
+    /// Display label for the current scenario selection: the bundled scenario's
+    /// name, or the "Add your own…" sentinel in paste mode.
+    fn current_label(&self) -> &str {
+        if self.custom {
+            "Add your own…"
+        } else {
+            self.scenarios.get(self.current).map(|s| s.0.as_str()).unwrap_or("")
+        }
+    }
+
     /// Hit-test the scene entity under the cursor (front hemisphere only, when
     /// outside the globe). Shared by the hover tooltip and click-to-focus.
     fn pick(&self, ptr: egui::Pos2, rect: egui::Rect, vp: glam::Mat4) -> Option<Picked> {
@@ -855,10 +957,9 @@ impl App {
         let revealed = (self.revealed as usize).min(l.trace.events.len());
         match picked {
             Picked::Sat(i) => {
-                let load = l.trace.events[..revealed]
-                    .iter()
-                    .filter(|e| e.sat as usize == i)
-                    .count();
+                // `sat_events[i]` is ascending event order, so the beams revealed
+                // so far is simply how many of its indices precede `revealed`.
+                let load = l.sat_events[i].partition_point(|&ei| (ei as usize) < revealed);
                 Some(Hover {
                     title: format!("Satellite {}", l.scn.sat_ids[i]),
                     lines: vec![format!("{load} / 32 beams in use"), "click to focus →".into()],
@@ -867,12 +968,14 @@ impl App {
                 })
             }
             Picked::User(i) => {
-                if let Some(e) = l.trace.events[..revealed]
-                    .iter()
-                    .find(|e| e.user as usize == i)
-                {
+                // Each user has at most one beam (`user_event[i]`), so served /
+                // pending resolves in O(1) — no scan of the revealed events.
+                let title = format!("Terminal {}", l.scn.user_ids[i]);
+                let ev = l.user_event[i];
+                if ev >= 0 && (ev as usize) < revealed {
+                    let e = &l.trace.events[ev as usize];
                     Some(Hover {
-                        title: format!("Terminal {}", l.scn.user_ids[i]),
+                        title,
                         lines: vec![format!(
                             "served · band {} · sat {}",
                             BANDS[e.color as usize], l.scn.sat_ids[e.sat as usize]
@@ -881,15 +984,20 @@ impl App {
                         interferer: None,
                     })
                 } else {
-                    let line = l
-                        .trace
-                        .unassigned
-                        .iter()
-                        .find(|u| u.user as usize == i)
-                        .map(|u| u.reason.label().to_string())
-                        .unwrap_or_else(|| "not yet assigned".into());
+                    // Served-but-not-yet-revealed needs no lookup; only a genuine
+                    // miss (`ev < 0`) consults the unassigned list for its reason.
+                    let line = if ev >= 0 {
+                        "not yet assigned".to_string()
+                    } else {
+                        l.trace
+                            .unassigned
+                            .iter()
+                            .find(|u| u.user as usize == i)
+                            .map(|u| u.reason.label().to_string())
+                            .unwrap_or_else(|| "not yet assigned".into())
+                    };
                     Some(Hover {
-                        title: format!("Terminal {}", l.scn.user_ids[i]),
+                        title,
                         lines: vec![line],
                         band: None,
                         interferer: None,
@@ -950,9 +1058,6 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Build the points + beams to display for the current frame. In satellite
-    /// focus mode the whole-constellation view is replaced by an isolated study
-    /// of one satellite.
     /// Refill `self.bufs` with the points/beams for the current frame. In focus
     /// mode the whole-constellation view is replaced by an isolated study.
     fn build_world(&mut self, hover_interferer: Option<usize>) {
@@ -1011,58 +1116,99 @@ impl App {
 
     // Top-left: every selector + toggle in one always-visible glass column.
     fn left_panel(&mut self, ui: &mut egui::Ui) {
-        const W: f32 = 214.0;
+        // Wide enough that the longest scenario name and the layer toggles (two
+        // rows) fit without overflowing — the panel is a fixed, tidy width and
+        // combos truncate rather than stretch the backdrop.
+        const W: f32 = 290.0;
         ui.set_width(W);
+        // Header doubles as a minimize control: tap the title or the chevron to
+        // collapse the panel to just this row (reclaims space on small screens).
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("BEAMER").color(WHITE).strong().size(15.0));
-            // A blinking LIVE telltale, padded flush to the panel's right edge.
-            // (Globe view only — focus mode carries its own ● LOCK telltale.)
-            if self.playing && self.loaded.is_some() && self.focused_sat.is_none() {
-                let p = (0.5 + 0.5 * (self.time * 3.0).sin()) * 255.0;
-                let c = egui::Color32::from_rgba_unmultiplied(120, 230, 160, p as u8);
-                let font = egui::FontId::new(9.5, egui::FontFamily::Monospace);
-                let w = ui
-                    .fonts(|f| f.layout_no_wrap("● LIVE".to_owned(), font, c))
-                    .size()
-                    .x;
-                ui.add_space((ui.available_width() - w).max(0.0));
-                ui.label(egui::RichText::new("● LIVE").color(c).size(9.5).strong());
+            let title = ui.add(
+                egui::Label::new(egui::RichText::new("BEAMER").color(WHITE).strong().size(15.0))
+                    .sense(egui::Sense::click()),
+            );
+            if title.clicked() {
+                self.left_collapsed = !self.left_collapsed;
             }
-        });
-        ui.label(
-            egui::RichText::new("FIRE-CONTROL // BEAM PLANNER")
-                .color(DIM)
-                .size(9.0),
-        );
-        ui.add_space(13.0);
-
-        // Scenario.
-        section(ui, "SCENARIO");
-        let mut changed_scn = false;
-        let current_label = self
-            .scenarios
-            .get(self.current)
-            .map(|s| s.0.as_str())
-            .unwrap_or("");
-        egui::ComboBox::from_id_salt("scn")
-            .selected_text(current_label)
-            .width(W)
-            .show_ui(ui, |ui| {
-                for (i, (label, _)) in self.scenarios.iter().enumerate() {
-                    if ui.selectable_label(self.current == i, label).clicked() {
-                        self.current = i;
-                        changed_scn = true;
-                    }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let chevron = if self.left_collapsed { "▸" } else { "▾" };
+                if ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(chevron).color(DIM).size(13.0))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(if self.left_collapsed { "Expand" } else { "Minimize" })
+                    .clicked()
+                {
+                    self.left_collapsed = !self.left_collapsed;
+                }
+                // Blinking LIVE telltale (globe view only — focus mode carries its
+                // own ● LOCK telltale).
+                if self.playing && self.loaded.is_some() && self.focused_sat.is_none() {
+                    let p = (0.5 + 0.5 * (self.time * 3.0).sin()) * 255.0;
+                    let c = egui::Color32::from_rgba_unmultiplied(120, 230, 160, p as u8);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("● LIVE").color(c).size(9.5).strong());
                 }
             });
-
-        // Algorithm.
+        });
+        if self.left_collapsed {
+            return;
+        }
         ui.add_space(11.0);
+
+        // ── SCENARIO (+ a Download-solution button to its right) ─────────────
+        section(ui, "SCENARIO");
+        let mut changed_scn = false;
+        // The Matching view is the capacitated-matching upper bound (4-coloring
+        // ignored) — not a valid solution — so it isn't downloadable.
+        let can_download = self.loaded.is_some() && self.algo != Algorithm::Matching;
+        ui.horizontal(|ui| {
+            let combo_w = if can_download { W - 36.0 } else { W };
+            let current_label = self.current_label();
+            let combo = egui::ComboBox::from_id_salt("scn")
+                .selected_text(current_label)
+                .width(combo_w)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for (i, (label, _)) in self.scenarios.iter().enumerate() {
+                        if ui.selectable_label(!self.custom && self.current == i, label).clicked() {
+                            self.current = i;
+                            self.custom = false;
+                            changed_scn = true;
+                        }
+                    }
+                    ui.separator();
+                    // Add-your-own: clear the previous solve on select (load() drops
+                    // `loaded`, and the empty-text branch returns without solving, so
+                    // the globe stays empty until a file is uploaded / dropped).
+                    if ui.selectable_label(self.custom, "Add your own…").clicked() && !self.custom {
+                        self.custom = true;
+                        changed_scn = true;
+                    }
+                });
+            // Match the combo's exact height so the button aligns flush with it.
+            if can_download
+                && ui
+                    .add_sized([28.0, combo.response.rect.height()], egui::Button::new("↓"))
+                    .on_hover_text("Download the validator-format solution (certificate + beam allocation)")
+                    .clicked()
+            {
+                self.download_solution();
+            }
+        });
+
+        // (Upload / paste / drag-and-drop for "Add your own…" is the center dialog.)
+
+        // ── ALGORITHM ───────────────────────────────────────────────────────
+        ui.add_space(10.0);
         section(ui, "ALGORITHM");
         let mut changed_algo = false;
         egui::ComboBox::from_id_salt("algo")
             .selected_text(self.algo.name())
             .width(W)
+            .truncate()
             .show_ui(ui, |ui| {
                 for a in Algorithm::ALL {
                     if ui.selectable_label(self.algo == a, a.name()).clicked() {
@@ -1072,62 +1218,155 @@ impl App {
                 }
             });
 
-        // Color bands.
-        ui.add_space(11.0);
-        section(ui, "BANDS");
+        // ── DISPLAY (color bands + scene layers) ─────────────────────────────
+        ui.add_space(10.0);
+        section(ui, "DISPLAY");
+        // When a satellite is focused, the A/B/C/D chips show *its* per-band beam
+        // counts ("A 8") and toggle that satellite's bands; otherwise they're the
+        // global band filter ("A").
+        let focus_counts: Option<[u32; 4]> = self.focused_sat.and_then(|s| {
+            self.loaded.as_ref().map(|l| {
+                let mut bc = [0u32; 4];
+                for &ei in &l.sat_events[s] {
+                    bc[l.trace.events[ei as usize].color as usize] += 1;
+                }
+                bc
+            })
+        });
         ui.horizontal(|ui| {
+            let cw = (W - 3.0 * ui.spacing().item_spacing.x) / 4.0;
             for c in 0..4u8 {
-                if band_chip(ui, c, self.bands[c as usize], BANDS[c as usize], [47.0, 26.0]).clicked() {
-                    self.bands[c as usize] = !self.bands[c as usize];
+                let (on, label) = match focus_counts {
+                    Some(bc) => (self.focus_bands[c as usize], format!("{} {}", BANDS[c as usize], bc[c as usize])),
+                    None => (self.bands[c as usize], BANDS[c as usize].to_string()),
+                };
+                if band_chip(ui, c, on, &label, [cw, 26.0]).clicked() {
+                    if focus_counts.is_some() {
+                        self.focus_bands[c as usize] = !self.focus_bands[c as usize];
+                    } else {
+                        self.bands[c as usize] = !self.bands[c as usize];
+                    }
                 }
             }
         });
-
-        // Layers.
-        ui.add_space(11.0);
-        section(ui, "LAYERS");
-        ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut self.show_beams, "Beams");
-            ui.toggle_value(&mut self.show_full, "Full");
-            ui.toggle_value(&mut self.show_empty, "Partial");
-            ui.toggle_value(&mut self.show_uncovered, "Uncovered");
-            ui.toggle_value(&mut self.show_interferers, "Interferers")
+        ui.add_space(5.0);
+        // Scene layers as a filled grid (no ragged white space): three then two,
+        // each cell stretched to fill its row.
+        let sp = ui.spacing().item_spacing.x;
+        let (w3, w2) = ((W - 2.0 * sp) / 3.0, (W - sp) / 2.0);
+        ui.horizontal(|ui| {
+            layer_toggle(ui, w3, &mut self.show_beams, "Beams");
+            layer_toggle(ui, w3, &mut self.show_full, "Full");
+            layer_toggle(ui, w3, &mut self.show_empty, "Partial");
+        });
+        ui.horizontal(|ui| {
+            layer_toggle(ui, w2, &mut self.show_uncovered, "Uncovered");
+            layer_toggle(ui, w2, &mut self.show_interferers, "Interferers")
                 .on_hover_text("Non-Starlink satellites — hover one to see its 20° field of interference");
         });
 
-        // Basemap.
-        ui.add_space(11.0);
-        section(ui, "BASEMAP");
+        // ── GLOBE (basemap + atmosphere-halo toggle) ─────────────────────────
+        ui.add_space(10.0);
+        section(ui, "GLOBE");
         let mut pick = None;
-        egui::ComboBox::from_id_salt("basemap")
-            .selected_text(self.tile_source.label())
-            .width(W)
-            .show_ui(ui, |ui| {
-                for src in tiles::TileSource::ALL {
-                    if ui
-                        .selectable_label(self.tile_source == src, src.label())
-                        .clicked()
-                    {
-                        pick = Some(src);
+        ui.horizontal(|ui| {
+            let combo = egui::ComboBox::from_id_salt("basemap")
+                .selected_text(self.tile_source.label())
+                .width(W - 36.0)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for src in tiles::TileSource::ALL {
+                        if ui.selectable_label(self.tile_source == src, src.label()).clicked() {
+                            pick = Some(src);
+                        }
                     }
-                }
-            });
+                });
+            // Atmosphere-halo toggle, flush to the right of the basemap dropdown.
+            // "○" reads as the halo ring; highlighted when the glow is on.
+            if ui
+                .add_sized(
+                    [28.0, combo.response.rect.height()],
+                    egui::Button::selectable(self.show_atmosphere, "○"),
+                )
+                .on_hover_text("Atmosphere halo — Fresnel glow, independent of the basemap")
+                .clicked()
+            {
+                self.show_atmosphere = !self.show_atmosphere;
+            }
+        });
         if let Some(src) = pick {
             self.tile_source = src;
             self.scene.set_tile_source(src);
         }
-        ui.add_space(7.0);
-        ui.toggle_value(&mut self.show_atmosphere, "Atmosphere halo")
-            .on_hover_text("Fresnel atmosphere glow — independent of the basemap");
 
         if changed_scn {
             // A different scenario means different satellites — drop the focus.
             self.exit_focus();
             self.load();
         } else if changed_algo {
-            // Same satellites: keep focus so the change re-renders for this one.
-            self.rerun();
+            // Same satellites: keep focus (no exit_focus) so the re-solve
+            // re-renders for the currently focused one.
+            self.load();
         }
+    }
+
+    // Center dialog for "Add your own…": upload a file, paste text, or drop a file.
+    // Shown while in custom mode with nothing solved yet; once a solve lands the
+    // normal HUD returns. Painted with the same glass + brackets as every panel.
+    fn custom_dialog(&mut self, ui: &mut egui::Ui) {
+        const W: f32 = 330.0;
+        ui.set_width(W);
+        shadow_text(ui, "ADD YOUR OWN", 17.0, WHITE);
+        ui.label(
+            egui::RichText::new("Upload, paste, or drop a scenario — validator format.")
+                .color(DIM)
+                .size(10.0),
+        );
+        ui.add_space(11.0);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if ui
+                .add_sized([W, 30.0], egui::Button::new("⬆  Upload a scenario file"))
+                .clicked()
+            {
+                self.open_file_picker();
+            }
+            ui.add_space(10.0);
+        }
+
+        section(ui, "OR PASTE");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.custom_text)
+                .hint_text("# satellites / users / interferers in ECEF…")
+                .desired_rows(6)
+                .desired_width(W)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(6.0);
+        let can_solve = !self.custom_text.trim().is_empty();
+        if ui
+            .add_enabled(can_solve, egui::Button::new("Solve").min_size(egui::vec2(W, 28.0)))
+            .clicked()
+        {
+            self.load();
+        }
+        // A parse / validation failure (e.g. a comment-only paste) lands here
+        // rather than rendering an empty scene.
+        if let Some(e) = &self.error {
+            ui.add_space(7.0);
+            ui.label(
+                egui::RichText::new(format!("⚠ {e}"))
+                    .color(egui::Color32::from_rgb(255, 120, 95))
+                    .size(10.5),
+            );
+        }
+        ui.add_space(9.0);
+        ui.label(
+            egui::RichText::new("…or drag & drop a scenario file anywhere")
+                .color(DIM)
+                .size(10.0),
+        );
     }
 
     // Top-right: the coverage headline. (The loading state is drawn as a
@@ -1198,27 +1437,44 @@ impl App {
                         );
                     }
                 }
-            } else if let Some(e) = &self.error {
+            }
+            // Surface a load/solve/download error even while a previous solution is
+            // still shown — download failures set `error` with `loaded` non-None.
+            if let Some(e) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, e);
             }
         });
     }
 
     // Bottom-center: transport — rerun, restart, play/pause, scrubber, speed.
-    fn transport_module(&mut self, ui: &mut egui::Ui) {
+    fn transport_module(&mut self, ui: &mut egui::Ui, compact: bool) {
+        const SPEEDS: [f64; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
+        let rate_label = |m: f64| if m < 1.0 { format!("{m}×") } else { format!("{}×", m as i64) };
         let total = self.total_events();
         let done = (self.revealed as usize).min(total);
+
+        // The bar auto-sizes to its content (no fixed width → no empty space). Only
+        // the scrubber scales with the viewport; it's bounded so the bar still clears
+        // the bottom-right unserved card. The count/speed cluster sits flush after it.
+        let screen_w = ui.ctx().content_rect().width();
+        let scrubber_w = if compact {
+            (screen_w - 470.0).clamp(80.0, 200.0)
+        } else {
+            (screen_w - 1080.0).clamp(150.0, 240.0)
+        };
+
         ui.horizontal(|ui| {
+            // Left transport controls (RERUN icon-only when compact).
+            let (rerun, rerun_w) = if compact { ("⟲", 30.0) } else { ("⟲ RERUN", 84.0) };
             if ui
-                .add_sized([84.0, 28.0], egui::Button::new("⟲ RERUN"))
+                .add_sized([rerun_w, 28.0], egui::Button::new(rerun))
                 .on_hover_text("Re-solve the scenario with the selected algorithm")
                 .clicked()
             {
-                self.rerun();
+                self.load();
             }
-            ui.separator();
             if ui
-                .add_sized([34.0, 28.0], egui::Button::new("⏮"))
+                .add_sized([if compact { 30.0 } else { 34.0 }, 28.0], egui::Button::new("⏮"))
                 .on_hover_text("Restart")
                 .clicked()
             {
@@ -1227,7 +1483,10 @@ impl App {
             }
             let lbl = if self.playing { "[ ⏸ ]" } else { "[ ▶ ]" };
             if ui
-                .add_sized([46.0, 28.0], egui::Button::new(egui::RichText::new(lbl).size(14.0)))
+                .add_sized(
+                    [if compact { 40.0 } else { 46.0 }, 28.0],
+                    egui::Button::new(egui::RichText::new(lbl).size(14.0)),
+                )
                 .clicked()
             {
                 if done >= total {
@@ -1235,31 +1494,39 @@ impl App {
                 }
                 self.playing = !self.playing;
             }
+
+            // Set the rail width directly (not via add_sized, which would leave the
+            // rail un-stretched inside a padded box → visible whitespace).
             let mut rev = self.revealed.min(total as f64);
-            let resp = ui.add_sized(
-                [320.0, 18.0],
+            ui.spacing_mut().slider_width = scrubber_w;
+            let resp = ui.add(
                 egui::Slider::new(&mut rev, 0.0..=(total.max(1) as f64)).show_value(false),
             );
             if resp.dragged() || resp.changed() {
                 self.revealed = rev;
                 self.playing = false;
             }
-            ui.label(
-                egui::RichText::new(format!("{done} / {total}"))
-                    .color(WHITE)
-                    .size(11.0),
-            );
-            ui.separator();
-            ui.label(egui::RichText::new("RATE").color(DIM).size(10.0));
-            for &m in &[0.5f64, 1.0, 2.0, 4.0, 8.0] {
-                let on = (self.speed_mult - m).abs() < 1e-6;
-                let label = if m < 1.0 {
-                    format!("{m}×")
-                } else {
-                    format!("{}×", m as i64)
-                };
-                if ui.selectable_label(on, label).clicked() {
-                    self.speed_mult = m;
+
+            if compact {
+                // One cycling speed chip flush after the scrubber — saves width, and
+                // the top-right readout already carries the covered count.
+                if ui
+                    .add_sized([40.0, 24.0], egui::Button::new(rate_label(self.speed_mult)))
+                    .on_hover_text("Playback speed (tap to cycle)")
+                    .clicked()
+                {
+                    let i = SPEEDS.iter().position(|&m| (m - self.speed_mult).abs() < 1e-6).unwrap_or(1);
+                    self.speed_mult = SPEEDS[(i + 1) % SPEEDS.len()];
+                }
+            } else {
+                // The count sits flush against the scrubber's right edge ("up to the
+                // numbers"); RATE presets follow.
+                ui.label(egui::RichText::new(format!("{done} / {total}")).color(WHITE).size(11.0));
+                ui.label(egui::RichText::new("RATE").color(DIM).size(10.0));
+                for &m in &SPEEDS {
+                    if ui.selectable_label((self.speed_mult - m).abs() < 1e-6, rate_label(m)).clicked() {
+                        self.speed_mult = m;
+                    }
                 }
             }
         });
@@ -1268,18 +1535,46 @@ impl App {
     // Unserved card: why terminals failed + jump-to list. Returns a clicked index.
     fn unserved_module(&mut self, ui: &mut egui::Ui) -> Option<usize> {
         const W: f32 = 250.0;
+        let n_unserved = self.loaded.as_ref().map(|l| l.trace.unassigned.len())?;
         ui.set_width(W);
         let mut clicked = None;
-        let Some(l) = &self.loaded else { return None };
+        // Header spans the full width: title left, fault count + minimize chevron
+        // right. Tapping the title or the chevron collapses the card.
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Label::new(egui::RichText::new("UNSERVED // FAULTS").color(DIM).size(10.0).strong())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(if self.unserved_collapsed { "Expand" } else { "Minimize" })
+                .clicked()
+            {
+                toggle = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let chevron = if self.unserved_collapsed { "▸" } else { "▾" };
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(chevron).color(DIM).size(10.0)).sense(egui::Sense::click()))
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("×{n_unserved}")).color(DIM).size(10.0).strong());
+            });
+        });
+        if toggle {
+            self.unserved_collapsed = !self.unserved_collapsed;
+        }
+        if self.unserved_collapsed {
+            return None;
+        }
+
+        // Body: right-aligned so it hugs the bottom-right corner.
+        let l = self.loaded.as_ref().unwrap();
         let t = &l.trace;
-        // Everything right-aligned so the block hugs the bottom-right corner.
         ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-            ui.label(
-                egui::RichText::new("UNSERVED // FAULTS")
-                    .color(DIM)
-                    .size(10.0)
-                    .strong(),
-            );
             ui.add_space(3.0);
             for (idx, &count) in l.reason_counts.iter().enumerate() {
                 if count == 0 {
@@ -1301,14 +1596,24 @@ impl App {
                         .size(9.0),
                 );
                 ui.add_space(2.0);
-                // auto_shrink y=true keeps the list bounded (≤ max_height) so the
-                // bottom-anchored panel measures correctly and never overflows.
+                // Virtualized: lay out only the on-screen rows (the list can hold
+                // thousands of faults on oversubscribed scenarios, and this runs every
+                // frame). auto_shrink y=true keeps the bottom-anchored panel measuring
+                // correctly. Rows are uniform single labels, so a fixed height is exact.
+                let n = t.unassigned.len().min(4000);
+                let line_h = ui
+                    .painter()
+                    .layout_no_wrap("0".to_owned(), egui::FontId::monospace(11.0), WHITE)
+                    .size()
+                    .y;
+                let row_h = (line_h + 2.0 * ui.spacing().button_padding.y).max(ui.spacing().interact_size.y);
                 egui::ScrollArea::vertical()
                     .max_height(150.0)
                     .auto_shrink([false, true])
-                    .show(ui, |ui| {
+                    .show_rows(ui, row_h, n, |ui, range| {
                         ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-                            for (i, info) in t.unassigned.iter().enumerate().take(4000) {
+                            for i in range {
+                                let info = &t.unassigned[i];
                                 let sel = self.selected == Some(i);
                                 let txt = egui::RichText::new(format!(
                                     "terminal {} · {}",
@@ -1317,11 +1622,15 @@ impl App {
                                 ))
                                 .color(reason_color(info.reason))
                                 .size(11.0);
-                                let resp = ui.selectable_label(sel, txt).on_hover_text(format!(
-                                    "{}\nsatellites in view: {}",
-                                    info.reason.detail(),
-                                    info.in_view
-                                ));
+                                // Build the tooltip only on actual hover, not per row/frame.
+                                let (reason, in_view) = (info.reason, info.in_view);
+                                let resp = ui.selectable_label(sel, txt).on_hover_ui(|ui| {
+                                    ui.label(format!(
+                                        "{}\nsatellites in view: {}",
+                                        reason.detail(),
+                                        in_view
+                                    ));
+                                });
                                 if resp.clicked() {
                                     clicked = Some(i);
                                 }
@@ -1340,29 +1649,27 @@ impl App {
     fn focus_panel(&mut self, ui: &mut egui::Ui) -> bool {
         const W: f32 = 254.0;
         let Some(s) = self.focused_sat else { return false };
-        let (sat_id, band_counts, total, near_n) = {
+        let (sat_id, total, near_n) = {
             let Some(l) = self.loaded.as_ref() else { return false };
             if s >= l.sat_pos.len() {
                 return false;
             }
-            let mut band_counts = [0u32; 4];
-            for &ei in &l.sat_events[s] {
-                band_counts[l.trace.events[ei as usize].color as usize] += 1;
-            }
-            let total: u32 = band_counts.iter().sum();
+            // Per-band counts now live in the left panel's A/B/C/D chips; here we
+            // only need the total (one event per served beam).
+            let total = l.sat_events[s].len() as u32;
             let sat_dir = l.sat_pos[s].normalize_or_zero();
             let near_n = l
                 .interferer_pos
                 .iter()
                 .filter(|ip| ip.normalize_or_zero().dot(sat_dir) > FOCUS_INTERFERER_COS)
                 .count();
-            (l.scn.sat_ids[s].clone(), band_counts, total, near_n)
+            (l.scn.sat_ids[s].clone(), total, near_n)
         };
 
         // Transparent padded frame: no fill/stroke (frameless), but the margin
         // gives the corner brackets room to read as a containing instrument.
-        let inner = egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(13.0, 11.0))
+        let inner = egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(13, 11))
             .show(ui, |ui| {
                 ui.set_width(W);
                 let mut close = false;
@@ -1385,29 +1692,13 @@ impl App {
                 ui.label(egui::RichText::new("TRACK // FOCUS").color(DIM).size(9.0));
                 ui.add_space(9.0);
 
+                // BEAMS gauge fills the width up to the "n / 32" count (no trailing
+                // whitespace). The per-band breakdown lives in the left A/B/C/D chips.
                 section(ui, "BEAMS");
+                let sp = ui.spacing().item_spacing.x;
                 ui.horizontal(|ui| {
-                    gauge(ui, 150.0, total as f32 / 32.0);
-                    ui.label(
-                        egui::RichText::new(format!("{total:02} / 32"))
-                            .color(WHITE)
-                            .size(10.0),
-                    );
-                });
-                ui.add_space(9.0);
-
-                // Interactive band toggles for the focus view (separate from the
-                // global `bands`). Counts are data; chip-off chrome is monochrome.
-                section(ui, "BANDS");
-                ui.horizontal(|ui| {
-                    for c in 0..4u8 {
-                        let label = format!("{}·{}", BANDS[c as usize], band_counts[c as usize]);
-                        if band_chip(ui, c, self.focus_bands[c as usize], &label, [54.0, 24.0])
-                            .clicked()
-                        {
-                            self.focus_bands[c as usize] = !self.focus_bands[c as usize];
-                        }
-                    }
+                    gauge(ui, W - 46.0 - sp, total as f32 / 32.0);
+                    ui.label(egui::RichText::new(format!("{total:02} / 32")).color(WHITE).size(10.0));
                 });
                 ui.add_space(9.0);
 
@@ -1422,10 +1713,11 @@ impl App {
                 }
                 ui.add_space(9.0);
 
+                // REPLAY: play button + a scrubber that fills up to the count.
                 section(ui, "REPLAY");
                 ui.horizontal(|ui| {
                     let lbl = if self.focus_playing { "[ ⏸ ]" } else { "[ ▶ ]" };
-                    if ui.add(egui::Button::new(lbl)).clicked() {
+                    if ui.add_sized([38.0, 22.0], egui::Button::new(lbl)).clicked() {
                         if self.focus_playing {
                             self.focus_playing = false;
                         } else {
@@ -1440,6 +1732,7 @@ impl App {
                     } else {
                         total as f64
                     };
+                    ui.spacing_mut().slider_width = (W - 38.0 - 46.0 - 2.0 * sp).max(60.0);
                     let resp = ui.add(
                         egui::Slider::new(&mut shown, 0.0..=(total.max(1) as f64)).show_value(false),
                     );
@@ -1473,13 +1766,13 @@ fn gauge(ui: &mut egui::Ui, width: f32, frac: f32) {
     let p = ui.painter();
     p.rect_filled(
         egui::Rect::from_min_max(egui::pos2(rect.left(), y - 1.5), egui::pos2(rect.right(), y + 1.5)),
-        egui::Rounding::ZERO,
+        egui::CornerRadius::ZERO,
         alpha(22),
     );
     let fw = (width * frac.clamp(0.0, 1.0)).max(0.0);
     p.rect_filled(
         egui::Rect::from_min_max(egui::pos2(rect.left(), y - 1.5), egui::pos2(rect.left() + fw, y + 1.5)),
-        egui::Rounding::ZERO,
+        egui::CornerRadius::ZERO,
         alpha(190),
     );
 }
@@ -1542,7 +1835,12 @@ fn loading_overlay(painter: &egui::Painter, rect: egui::Rect, t: f32, name: &str
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.34 drives the app through `ui` with a frameless, full-window
+        // root `Ui`. Take an owned `Context` handle so the rest of the method
+        // reads exactly as the old `update(ctx, …)` did.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt;
         // Drive a continuous frame clock so the nebula, starfield, and overlays
@@ -1551,22 +1849,52 @@ impl eframe::App for App {
         // redundant (request_repaint is idempotent within a frame).
         ctx.request_repaint();
 
-        // Toggle the whole HUD for a clean cinematic view.
-        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
-            self.show_ui = !self.show_ui;
+        // Responsive HUD scale for small / mobile viewports: shrink the whole UI so
+        // the controls don't dominate a narrow screen. `content_rect().width()` is in
+        // points (physical px ÷ pixels_per_point), and pixels_per_point = native ×
+        // zoom, so `width × zoom` is the device-independent CSS width — invariant to
+        // the zoom we set here, so it converges in one frame. The 3D scene fills its
+        // rect at full physical resolution regardless, so only the HUD scales — the
+        // globe stays crisp. `compact` then relays the bottom row so it can't overlap.
+        let css_w = ctx.content_rect().width() * ctx.zoom_factor();
+        let target_zoom = (css_w / 940.0).clamp(0.62, 1.0);
+        if (ctx.zoom_factor() - target_zoom).abs() > 0.01 {
+            ctx.set_zoom_factor(target_zoom);
         }
-        // Fullscreen controls: F11 toggles, Esc exits — never trap the user.
-        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        }
+        // Layout regime, in points (= physical px ÷ pixels_per_point):
+        //  • `compact`  — condense the transport and pin it bottom-left, so it and
+        //    the bottom-right unserved card both fit a phone/tablet width.
+        //  • `short`    — a landscape-phone-height viewport, where the tall left
+        //    column is capped + scrollable so it can't overflow into the transport.
+        let sr = ctx.content_rect();
+        let compact = sr.width() < 1240.0;
+        let short = sr.height() < 520.0;
+
+        // Escape, in order: dismiss the "Add your own…" dialog (even while its text
+        // box has focus, so it always gets you out), then leave satellite focus,
+        // then exit fullscreen — never trap the user.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            // Esc leaves satellite focus first, then fullscreen — never trap the user.
-            if self.focused_sat.is_some() {
-                self.exit_focus();
-            } else if self.fullscreen {
-                self.fullscreen = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            if self.custom && self.loaded.is_none() && self.loading.is_none() {
+                self.exit_custom();
+            } else if !ctx.egui_wants_keyboard_input() {
+                if self.focused_sat.is_some() {
+                    self.exit_focus();
+                } else if self.fullscreen {
+                    self.fullscreen = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+            }
+        }
+        // H (hide HUD) / F11 (fullscreen) — suppressed while a widget wants keyboard
+        // input (e.g. the paste box has focus), so typing a scenario can't fire them.
+        // egui's `key_pressed` reports keys regardless of focus, so the guard is required.
+        if !ctx.egui_wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+                self.show_ui = !self.show_ui;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+                self.fullscreen = !self.fullscreen;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
         }
 
@@ -1594,6 +1922,24 @@ impl eframe::App for App {
                     self.error = Some("solver thread terminated unexpectedly".into());
                     self.loading = None;
                 }
+            }
+        }
+
+        // An uploaded (file-picker) or drag-and-dropped scenario → solve it.
+        if let Some(rx) = self.upload_rx.as_ref() {
+            if let Ok(text) = rx.try_recv() {
+                self.upload_rx = None;
+                self.ingest_scenario(text);
+            }
+        }
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().cloned());
+        if let Some(file) = dropped {
+            // Web delivers the bytes inline; native delivers a path to read.
+            let text = file.bytes.as_ref().and_then(|b| String::from_utf8(b.to_vec()).ok());
+            #[cfg(not(target_arch = "wasm32"))]
+            let text = text.or_else(|| file.path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()));
+            if let Some(text) = text {
+                self.ingest_scenario(text);
             }
         }
 
@@ -1638,21 +1984,38 @@ impl eframe::App for App {
             }
         }
 
+        // "Add your own…" with nothing solved yet shows the center dialog; a click on
+        // the bare scene (egui routes dialog/panel clicks to those areas, so this only
+        // fires off them) dismisses it — see the click handler below.
+        let awaiting_custom = self.custom && self.loaded.is_none() && self.loading.is_none();
+        let mut dismiss_custom = false;
+
         // Full-window 3D scene.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
                 let size = ui.available_size();
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                if response.dragged() {
-                    let d = response.drag_delta();
-                    self.camera.orbit(d.x, d.y);
-                    self.anim = None;
-                }
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.camera.zoom(scroll);
+                // Camera input: two-finger pinch zooms (touch); otherwise a
+                // one-finger / mouse drag orbits and the wheel zooms. Orbit is
+                // suppressed during a pinch so the globe doesn't lurch as the
+                // touch centroid drifts.
+                if let Some(mt) = ui.input(|i| i.multi_touch()) {
+                    if mt.zoom_delta != 1.0 {
+                        self.camera.zoom_by(mt.zoom_delta);
+                        self.anim = None;
+                    }
+                } else {
+                    if response.dragged() {
+                        let d = response.drag_delta();
+                        self.camera.orbit(d.x, d.y);
+                        self.anim = None;
+                    }
+                    if response.hovered() {
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            self.camera.zoom(scroll);
+                        }
                     }
                 }
                 let ppp = ctx.pixels_per_point();
@@ -1680,9 +2043,16 @@ impl eframe::App for App {
                 self.scene.set_focus_mode(focused);
                 self.scene
                     .set_load(if self.loading.is_some() { self.time } else { 0.0 });
-                // Click a satellite to focus it; click empty space to leave focus.
+                // A bare-scene click: dismiss the "Add your own…" dialog if it's up,
+                // else focus a clicked satellite / leave focus on empty space.
                 if response.clicked() {
-                    if let Some(p) = response.interact_pointer_pos() {
+                    if awaiting_custom {
+                        dismiss_custom = true;
+                    } else if self.focused_sat.is_some() {
+                        // Focus mode renders a local-space schematic, so an ECEF pick
+                        // is meaningless here — any scene click is a deliberate exit.
+                        self.exit_focus();
+                    } else if let Some(p) = response.interact_pointer_pos() {
                         match self.pick(p, rect, vp) {
                             Some(Picked::Sat(s)) => self.enter_focus(s),
                             _ => self.exit_focus(),
@@ -1755,7 +2125,7 @@ impl eframe::App for App {
                                 egui::pos2(rect.left(), y),
                                 egui::pos2(rect.right(), y + 1.5),
                             ),
-                            egui::Rounding::ZERO,
+                            egui::CornerRadius::ZERO,
                             alpha(20),
                         );
                     }
@@ -1763,11 +2133,13 @@ impl eframe::App for App {
 
                 // Full-screen "TARGET ACQUISITION" sequence while a solve runs.
                 if self.loading.is_some() {
-                    let name = self
-                        .scenarios
-                        .get(self.current)
-                        .map(|s| s.0.as_str())
-                        .unwrap_or("");
+                    // In "Add your own…" mode there is no bundled scenario name —
+                    // don't mislabel it with the last-selected one.
+                    let name = if self.custom {
+                        "custom scenario"
+                    } else {
+                        self.scenarios.get(self.current).map(|s| s.0.as_str()).unwrap_or("")
+                    };
                     loading_overlay(ui.painter(), rect, self.time, name, self.algo.name());
                 }
 
@@ -1801,11 +2173,28 @@ impl eframe::App for App {
         // bottom-center, unserved inspector bottom-right. `H` hides it all.
         let mut clicked = None;
         let mut close_focus = false;
+        // `awaiting_custom` (computed above) → a center dialog stands in for the
+        // coverage / transport / unserved modules (there's no solution to show).
         if self.show_ui {
+            // On a short (landscape-phone) screen the column is capped + scrollable
+            // so it can't overflow into the transport; tall screens show it in full.
+            let cap_h = (sr.height() - 110.0).max(150.0);
             egui::Area::new(egui::Id::new("left"))
                 .anchor(egui::Align2::LEFT_TOP, [18.0, 16.0])
                 .show(ctx, |ui| {
-                    let r = glass().show(ui, |ui| self.left_panel(ui)).response.rect;
+                    let r = glass()
+                        .show(ui, |ui| {
+                            if short {
+                                egui::ScrollArea::vertical()
+                                    .max_height(cap_h)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| self.left_panel(ui));
+                            } else {
+                                self.left_panel(ui);
+                            }
+                        })
+                        .response
+                        .rect;
                     brackets(ui.painter(), r, 13.0, alpha(45));
                 });
             if self.focused_sat.is_some() {
@@ -1814,14 +2203,31 @@ impl eframe::App for App {
                 egui::Area::new(egui::Id::new("focus"))
                     .anchor(egui::Align2::RIGHT_TOP, [-22.0, 18.0])
                     .show(ctx, |ui| close_focus = self.focus_panel(ui));
+            } else if awaiting_custom {
+                egui::Area::new(egui::Id::new("customdlg"))
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        let r = glass().show(ui, |ui| self.custom_dialog(ui)).response.rect;
+                        brackets(ui.painter(), r, 13.0, alpha(45));
+                    });
             } else {
                 egui::Area::new(egui::Id::new("cov"))
                     .anchor(egui::Align2::RIGHT_TOP, [-20.0, 18.0])
                     .show(ctx, |ui| self.coverage_module(ui));
+                // Centered transport normally; pinned bottom-left on narrow screens
+                // so it can't overlap the bottom-right unserved inspector.
+                let (t_anchor, t_offset) = if compact {
+                    (egui::Align2::LEFT_BOTTOM, [18.0, -16.0])
+                } else {
+                    (egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
+                };
                 egui::Area::new(egui::Id::new("transport"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
+                    .anchor(t_anchor, t_offset)
                     .show(ctx, |ui| {
-                        let r = glass().show(ui, |ui| self.transport_module(ui)).response.rect;
+                        let r = glass()
+                            .show(ui, |ui| self.transport_module(ui, compact))
+                            .response
+                            .rect;
                         brackets(ui.painter(), r, 13.0, alpha(45));
                     });
                 egui::Area::new(egui::Id::new("uns"))
@@ -1834,6 +2240,9 @@ impl eframe::App for App {
             }
         }
 
+        if dismiss_custom {
+            self.exit_custom();
+        }
         if close_focus {
             self.exit_focus();
         }
@@ -1917,12 +2326,22 @@ fn band_chip(ui: &mut egui::Ui, c: u8, on: bool, label: &str, size: [f32; 2]) ->
     let txt = egui::RichText::new(label).color(txt_col).strong();
     let resp = ui.add_sized(
         size,
-        egui::Button::new(txt).fill(fill).rounding(egui::Rounding::ZERO),
+        egui::Button::new(txt).fill(fill).corner_radius(egui::CornerRadius::ZERO),
     );
     if !on {
         let r = resp.rect;
         ui.painter()
             .line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0_f32, col));
+    }
+    resp
+}
+
+/// A fixed-width scene-layer toggle that flips `*on` when clicked. Returns the
+/// response so callers can attach a hover tooltip.
+fn layer_toggle(ui: &mut egui::Ui, w: f32, on: &mut bool, label: &str) -> egui::Response {
+    let resp = ui.add_sized([w, 24.0], egui::Button::selectable(*on, label));
+    if resp.clicked() {
+        *on = !*on;
     }
     resp
 }
@@ -1933,7 +2352,7 @@ fn shadow_text(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) -
     let font = egui::FontId::new(size, egui::FontFamily::Monospace);
     // Shape the run once, then draw it twice (cheap Arc clones): a shadow copy
     // recolored via the override, then the real text.
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, color));
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     let p = ui.painter();
     p.galley_with_override_text_color(rect.min + egui::vec2(1.0, 1.0), galley.clone(), SHADOW);
@@ -1954,10 +2373,10 @@ fn reason_color(r: Reason) -> egui::Color32 {
 /// brackets supply the containment). Composited by egui *over* the scene image
 /// with normal alpha, so the additive scene can never wash it out.
 fn glass() -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(6, 9, 13, 168))
-        .rounding(egui::Rounding::ZERO)
-        .inner_margin(egui::Margin::symmetric(14.0, 11.0))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::symmetric(14, 11))
 }
 
 /// Dark backing for the transient hover tooltip, faintly tinted toward the
@@ -1982,22 +2401,22 @@ fn tooltip_glass(band: Option<u8>) -> egui::Frame {
             alpha(40),
         ),
     };
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, stroke))
-        .rounding(egui::Rounding::ZERO)
-        .inner_margin(egui::Margin::same(9.0))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(9))
 }
 
 fn style_egui(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     let mut v = egui::Visuals::dark();
     v.panel_fill = egui::Color32::TRANSPARENT;
     v.override_text_color = Some(WHITE);
     // Dropdown menus / popups read as squared dark glass.
     v.window_fill = egui::Color32::from_rgba_unmultiplied(8, 11, 16, 232);
     v.window_stroke = egui::Stroke::new(1.0_f32, alpha(40));
-    v.window_rounding = egui::Rounding::ZERO;
+    v.window_corner_radius = egui::CornerRadius::ZERO;
     v.selection.bg_fill = alpha(30);
     v.selection.stroke = egui::Stroke::new(1.0_f32, WHITE);
     // Frameless controls: hairline border on a barely-there fill, all squared,
@@ -2013,7 +2432,7 @@ fn style_egui(ctx: &egui::Context) {
     .into_iter()
     .enumerate()
     {
-        w.rounding = egui::Rounding::ZERO;
+        w.corner_radius = egui::CornerRadius::ZERO;
         w.bg_stroke = egui::Stroke::new(1.0_f32, alpha(strokes[i]));
         w.weak_bg_fill = alpha(fills[i]);
         w.bg_fill = alpha(fills[i]);
@@ -2031,7 +2450,7 @@ fn style_egui(ctx: &egui::Context) {
     .into();
     style.spacing.item_spacing = egui::vec2(8.0, 7.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// Locate the `test_cases` directory: explicit env var, then the working
@@ -2091,35 +2510,95 @@ async fn fetch_scenario(url: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{url}: response was not valid UTF-8"))
 }
 
+/// Format a solved scenario as the validator-format solution: the near-optimality
+/// certificate header plus the per-satellite beam allocation — identical to what
+/// the CLI writes. Reconstructs `per_sat` from the trace's events (each event is a
+/// final beam), so it works for any algorithm.
+fn solution_text(l: &Loaded) -> Result<String, String> {
+    let (scn, tr) = (&l.scn, &l.trace);
+    let mut per_sat = vec![Vec::new(); scn.sats.len()];
+    for e in &tr.events {
+        per_sat[e.sat as usize].push((e.user, e.color));
+    }
+    let cert = io::Certificate {
+        total_users: scn.users.len(),
+        feasible_users: tr.feasible_users,
+        upper_bound: tr.upper_bound,
+        colored_bound: tr.colored_bound,
+        achieved: tr.events.len(),
+    };
+    let mut buf = Vec::new();
+    io::write_solution(&mut buf, scn, &per_sat, &cert).map_err(|e| e.to_string())?;
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+/// Reject a scenario the visualizer can't meaningfully show — a comment-only or
+/// empty paste parses cleanly into zero satellites/users, which would otherwise
+/// render as a confusing blank globe. The solver/CLI handle these fine; here we
+/// surface a clear error so "Add your own…" gives feedback instead of a void.
+fn validate_scenario(scn: &io::Scenario) -> Result<(), String> {
+    if scn.sats.is_empty() || scn.users.is_empty() {
+        return Err("scenario needs at least one `sat` and one `user` line".into());
+    }
+    Ok(())
+}
+
 /// Parse + solve scenario text into a [`Loaded`] (platform-independent: no I/O).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // native-only path on wasm
 fn build_loaded(text: &str, algo: Algorithm) -> Result<Loaded, String> {
     let scn = io::Scenario::parse(text).map_err(|e| format!("parse: {e}"))?;
+    validate_scenario(&scn)?;
     let feas = feasibility::build(&scn);
     let trace = trace::run(&scn, &feas, algo);
     Ok(loaded_from_parts(scn, feas, trace))
 }
 
 // ---- WASM: solve in a Web Worker, off the render thread ---------------------
-// `trace_scenario` (the Worker entry) lives in `crate::wasm` so the threaded
-// solver build — which has no `viz` feature — can also export it.
+// `trace_scenario` (the Worker entry) is exported at the bottom of this file; the
+// render thread imports `solveText` / `downloadText` from index.js.
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
-    /// JS glue (web/beamer.html): posts `{text, algo}` to the solve Worker and
-    /// resolves with the postcard bytes as a `Uint8Array`.
+    /// JS glue (index.js): posts `{text, algo}` to the solve Worker and resolves
+    /// with the postcard bytes as a `Uint8Array`.
     #[wasm_bindgen(js_name = solveText, catch)]
     async fn solve_text_js(text: &str, algo: u8) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+
+    /// JS glue (index.js): save `text` to the user's machine as `filename`.
+    #[wasm_bindgen(js_name = downloadText)]
+    fn download_text_js(filename: &str, text: &str);
+
+    /// JS glue (index.js): open the file picker and resolve with the chosen file's
+    /// text (empty string if the user cancels).
+    #[wasm_bindgen(js_name = pickScenario, catch)]
+    async fn pick_scenario_js() -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+/// A clean, human-readable message from a rejected-promise [`JsValue`] (an
+/// `Error`), without the raw `{:?}` debug form and its stack trace.
+#[cfg(target_arch = "wasm32")]
+fn js_error_message(e: &wasm_bindgen::JsValue) -> String {
+    use wasm_bindgen::JsCast;
+    e.dyn_ref::<js_sys::Error>()
+        .map(|err| String::from(err.message()))
+        .or_else(|| e.as_string())
+        .unwrap_or_else(|| "solve failed".to_string())
 }
 
 /// Fetch a scenario URL, solve it in the Worker, and rebuild [`Loaded`].
 #[cfg(target_arch = "wasm32")]
-async fn solve_via_worker(url: &str, algo: u8) -> Result<Loaded, String> {
+async fn solve_via_worker(url: &str, algo: Algorithm) -> Result<Loaded, String> {
     let text = fetch_scenario(url).await?;
-    let bytes = solve_text_js(&text, algo)
-        .await
-        .map_err(|e| format!("solve worker failed: {e:?}"))?;
+    solve_text_via_worker(&text, algo).await
+}
+
+/// Solve scenario `text` in the Worker and rebuild [`Loaded`]. Shared by the
+/// bundled-scenario path (after fetch) and "Add your own…" (pasted text).
+#[cfg(target_arch = "wasm32")]
+async fn solve_text_via_worker(text: &str, algo: Algorithm) -> Result<Loaded, String> {
+    let algo = Algorithm::ALL.iter().position(|&a| a == algo).unwrap_or(0) as u8;
+    let bytes = solve_text_js(text, algo).await.map_err(|e| js_error_message(&e))?;
     let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
     let (scn, feas, trace): (io::Scenario, feasibility::Feasibility, Trace) =
         postcard::from_bytes(&bytes).map_err(|e| format!("decode solve result: {e}"))?;
@@ -2131,33 +2610,24 @@ async fn solve_via_worker(url: &str, algo: u8) -> Result<Loaded, String> {
 /// unserved-reason counts. Cheap (just maps the data), so it runs on the render
 /// thread even on wasm — where the expensive parse + solve happen in a worker.
 fn loaded_from_parts(scn: io::Scenario, feas: feasibility::Feasibility, trace: Trace) -> Loaded {
-    let user_pos: Vec<Vec3> = scn
-        .users
-        .iter()
-        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
-        .collect();
-    let sat_pos: Vec<Vec3> = scn
-        .sats
-        .iter()
-        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
-        .collect();
-    let interferer_pos: Vec<Vec3> = scn
-        .interferers
-        .iter()
-        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
-        .collect();
+    let user_pos = to_f32(&scn.users);
+    let sat_pos = to_f32(&scn.sats);
+    let interferer_pos = to_f32(&scn.interferers);
     // Cache unit directions once (positions never move) for the hover cull.
-    let user_dir = user_pos.iter().map(|p| p.normalize()).collect();
-    let sat_dir = sat_pos.iter().map(|p| p.normalize()).collect();
-    let interferer_dir = interferer_pos.iter().map(|p| p.normalize()).collect();
+    let user_dir = unit_dirs(&user_pos);
+    let sat_dir = unit_dirs(&sat_pos);
+    let interferer_dir = unit_dirs(&interferer_pos);
     let mut reason_counts = [0usize; 4];
     for u in &trace.unassigned {
         reason_counts[reason_idx(u.reason)] += 1;
     }
-    // Per-satellite event index, in assignment order (events are already ordered).
+    // Per-satellite event indices and the single event per user, both derived in
+    // one pass over the already-ordered events.
     let mut sat_events = vec![Vec::new(); sat_pos.len()];
+    let mut user_event = vec![-1i32; user_pos.len()];
     for (i, e) in trace.events.iter().enumerate() {
         sat_events[e.sat as usize].push(i as u32);
+        user_event[e.user as usize] = i as i32;
     }
     Loaded {
         scn,
@@ -2170,25 +2640,37 @@ fn loaded_from_parts(scn: io::Scenario, feas: feasibility::Feasibility, trace: T
         interferer_dir,
         trace,
         sat_events,
+        user_event,
         reason_counts,
     }
+}
+
+/// Convert solver-space f64 positions to the GPU's f32 [`Vec3`].
+fn to_f32(pts: &[beamer::geom::Vec3]) -> Vec<Vec3> {
+    pts.iter()
+        .map(|p| Vec3::new(p.x as f32, p.y as f32, p.z as f32))
+        .collect()
+}
+/// Unit directions for a position list (positions are never at the origin).
+fn unit_dirs(pos: &[Vec3]) -> Vec<Vec3> {
+    pos.iter().map(|p| p.normalize()).collect()
 }
 
 /// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
 /// `--shot` and the `--frames` sequence renderer.
 #[cfg(not(target_arch = "wasm32"))]
-fn init_gpu() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
     }))
-    .ok_or("no GPU adapter")?;
+    .map_err(|e| format!("no GPU adapter: {e}"))?;
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| format!("device: {e}"))?;
-    Ok((Arc::new(device), Arc::new(queue)))
+    Ok((device, queue))
 }
 
 /// All scene layers on — the default look for headless stills and sequences.
@@ -2227,15 +2709,15 @@ fn save_frame(
     });
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     enc.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: scene.color_texture(),
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        wgpu::ImageCopyBuffer {
+        wgpu::TexelCopyBufferInfo {
             buffer: &buf,
-            layout: wgpu::ImageDataLayout {
+            layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
                 rows_per_image: Some(h),
@@ -2250,7 +2732,9 @@ fn save_frame(
     queue.submit(Some(enc.finish()));
 
     buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| format!("device poll: {e:?}"))?;
     let data = buf.slice(..).get_mapped_range();
     let mut pixels = Vec::with_capacity((w * h * 4) as usize);
     for row in 0..h {
@@ -2395,13 +2879,14 @@ pub fn run() -> eframe::Result<()> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
-    // Force the WebGL2 backend. wgpu 22 requests the `maxInterStageShaderComponents`
-    // device limit, which current browsers removed from the WebGPU spec, so the
-    // WebGPU `requestDevice` path is rejected. WebGL2 skips that negotiation.
-    // (Revisit once eframe/wgpu are on wgpu >= 23, where the limit is gone.)
+    // Force the GL (WebGL2) backend for the widest browser support. egui-wgpu
+    // 0.34 moved backend selection into `WgpuSetup`; override the instance
+    // descriptor's backends on the default "create new" setup.
+    let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.instance_descriptor.backends = wgpu::Backends::GL;
     let web_options = eframe::WebOptions {
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            supported_backends: wgpu::Backends::GL,
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
         },
         ..Default::default()
@@ -2440,6 +2925,55 @@ mod tests {
         let l = loaded_from_parts(scn2, feas2, trace2);
         assert_eq!(l.sat_pos.len(), n_sats);
         assert_eq!(l.sat_events.len(), n_sats);
+
+        // The per-user event cache the hover tooltip resolves against: one entry
+        // per user, and every event reachable by its user index (i.e. each user
+        // has at most one beam — the invariant the O(1) lookup depends on).
+        assert_eq!(l.user_event.len(), n_users);
+        for (i, e) in l.trace.events.iter().enumerate() {
+            assert_eq!(l.user_event[e.user as usize], i as i32);
+        }
+    }
+
+    // A comment-only / empty paste parses cleanly but has no geometry — the viz
+    // must reject it (instead of rendering a blank globe), while a real scenario
+    // passes. Guards the "Add your own…" invalid-input path.
+    #[test]
+    fn rejects_degenerate_scenario() {
+        let empty = io::Scenario::parse("# bla\n\n  # just comments\n").unwrap();
+        assert!(validate_scenario(&empty).is_err());
+
+        let real = io::Scenario::parse(include_str!("../../test_cases/03_five_users.txt")).unwrap();
+        assert!(validate_scenario(&real).is_ok());
+    }
+
+    // The "Download" button formats `solution_text` from a solved Loaded. Check it
+    // produces the validator format — certificate header + one beam line per event.
+    #[test]
+    fn solution_text_is_well_formed() {
+        let text = include_str!("../../test_cases/03_five_users.txt");
+        let l = build_loaded(text, Algorithm::Optimized).unwrap();
+        let out = solution_text(&l).unwrap();
+
+        assert!(out.starts_with("# beamer:"), "missing certificate header");
+        assert!(
+            out.contains(&format!("# achieved = {} ", l.trace.events.len())),
+            "achieved count must match the trace"
+        );
+        let beam_lines: Vec<&str> = out.lines().filter(|ln| ln.starts_with("sat ")).collect();
+        assert_eq!(beam_lines.len(), l.trace.events.len(), "one beam line per event");
+
+        // Each beam line must keep the validator's exact token shape.
+        for ln in beam_lines {
+            let t: Vec<&str> = ln.split_whitespace().collect();
+            assert!(
+                matches!(
+                    t.as_slice(),
+                    ["sat", _, "beam", _, "user", _, "color", c] if matches!(*c, "A" | "B" | "C" | "D")
+                ),
+                "malformed beam line: {ln}"
+            );
+        }
     }
 }
 
@@ -2454,6 +2988,7 @@ mod tests {
 pub fn trace_scenario(text: &str, algo: u8) -> Result<Vec<u8>, wasm_bindgen::JsError> {
     let algo = Algorithm::ALL.get(algo as usize).copied().unwrap_or(Algorithm::Optimized);
     let scn = io::Scenario::parse(text).map_err(|e| wasm_bindgen::JsError::new(&e))?;
+    validate_scenario(&scn).map_err(|e| wasm_bindgen::JsError::new(&e))?;
     let feas = feasibility::build(&scn);
     let tr = trace::run(&scn, &feas, algo);
     postcard::to_allocvec(&(scn, feas, tr)).map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))

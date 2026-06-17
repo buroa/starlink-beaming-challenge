@@ -8,7 +8,6 @@
 use super::tiles::{TileGlobe, TileSource};
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
-use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -51,8 +50,8 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MSAA: u32 = 4;
 
 pub struct Scene {
-    pub device: Arc<wgpu::Device>,
-    pub queue: Arc<wgpu::Queue>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
 
     camera_buf: wgpu::Buffer,
     cam_bind: wgpu::BindGroup,
@@ -95,7 +94,7 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -129,8 +128,8 @@ impl Scene {
 
         let layout0 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("layout0"),
-            bind_group_layouts: &[&cam_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&cam_layout)],
+            immediate_size: 0,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shaders"),
@@ -142,7 +141,7 @@ impl Scene {
             layout: Some(&layout0),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "bg_vs",
+                entry_point: Some("bg_vs"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
@@ -154,11 +153,11 @@ impl Scene {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "bg_fs",
+                entry_point: Some("bg_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(COLOR_FORMAT.into())],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -172,7 +171,7 @@ impl Scene {
             layout: Some(&layout0),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "atmo_vs",
+                entry_point: Some("atmo_vs"),
                 compilation_options: Default::default(),
                 buffers: globe_buffers,
             },
@@ -187,11 +186,11 @@ impl Scene {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "atmo_fs",
+                entry_point: Some("atmo_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(additive_target())],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -215,7 +214,7 @@ impl Scene {
             layout: Some(&layout0),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "point_vs",
+                entry_point: Some("point_vs"),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout {
@@ -235,11 +234,11 @@ impl Scene {
             multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "point_fs",
+                entry_point: Some("point_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(additive_target())],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -248,7 +247,7 @@ impl Scene {
             layout: Some(&layout0),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "beam_vs",
+                entry_point: Some("beam_vs"),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout {
@@ -268,11 +267,11 @@ impl Scene {
             multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "beam_fs",
+                entry_point: Some("beam_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(additive_target())],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -360,9 +359,9 @@ impl Scene {
         true
     }
 
-    /// Per-frame tile streaming update; returns true while tiles are loading.
-    pub fn update(&mut self, view_proj: Mat4, eye: Vec3, viewport_h: f32) -> bool {
-        self.tile_globe.update(view_proj, eye, viewport_h)
+    /// Per-frame tile streaming update.
+    pub fn update(&mut self, view_proj: Mat4, eye: Vec3, viewport_h: f32) {
+        self.tile_globe.update(view_proj, eye, viewport_h);
     }
 
     /// Switch the basemap (or turn it off → transparent earth). The atmosphere
@@ -448,6 +447,7 @@ impl Scene {
                 label: Some("scene-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa_view,
+                    depth_slice: None,
                     resolve_target: Some(&self.color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -464,6 +464,7 @@ impl Scene {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_bind_group(0, &self.cam_bind, &[]);
 
@@ -515,8 +516,8 @@ fn make_dyn(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
-        depth_write_enabled: write,
-        depth_compare: compare,
+        depth_write_enabled: Some(write),
+        depth_compare: Some(compare),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }

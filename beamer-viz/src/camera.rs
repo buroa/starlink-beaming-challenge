@@ -49,4 +49,12 @@ impl OrbitCamera {
     pub fn zoom(&mut self, scroll: f32) {
         self.distance = (self.distance * (1.0 - scroll * 0.0015)).clamp(40.0, 90_000.0);
     }
+
+    /// Pinch-zoom by a multiplicative factor (egui's two-finger `zoom_delta`):
+    /// `> 1` zooms in (fingers apart), `< 1` zooms out, sharing [`zoom`]'s clamp.
+    pub fn zoom_by(&mut self, factor: f32) {
+        if factor > 0.0 {
+            self.distance = (self.distance / factor).clamp(40.0, 90_000.0);
+        }
+    }
 }
