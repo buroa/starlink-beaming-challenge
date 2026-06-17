@@ -10,6 +10,9 @@ use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
+// `Arc` now only wraps the native worker pool's shared job queue (device/queue
+// are bare wgpu handles), so it is unused on the single-threaded wasm build.
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 // Native fetch backend only: the shared job queue (VecDeque) and the
 // Mutex/Condvar that the worker threads park on. Wasm fetches per-tile.
@@ -189,8 +192,8 @@ enum TileMsg {
 const MAX_TILE_RETRIES: u8 = 4;
 
 pub struct TileGlobe {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -219,8 +222,8 @@ pub struct TileGlobe {
 
 impl TileGlobe {
     pub fn new(
-        device: Arc<wgpu::Device>,
-        queue: Arc<wgpu::Queue>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
         cam_bgl: &wgpu::BindGroupLayout,
         samples: u32,
     ) -> Self {
@@ -262,13 +265,13 @@ impl TileGlobe {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile-layout"),
-            bind_group_layouts: &[cam_bgl, &tile_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(cam_bgl), Some(&tile_bgl)],
+            immediate_size: 0,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile-shader"),
@@ -279,7 +282,7 @@ impl TileGlobe {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs",
+                entry_point: Some("vs"),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: 8,
@@ -296,8 +299,8 @@ impl TileGlobe {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -307,11 +310,11 @@ impl TileGlobe {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs",
+                entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -402,9 +405,10 @@ impl TileGlobe {
     }
 
     /// Pump completed downloads, then recompute the visible tile set for this
-    /// camera and request any missing tiles. Returns true while tiles are still
-    /// streaming in (so the caller keeps repainting).
-    pub fn update(&mut self, view_proj: Mat4, eye: Vec3, viewport_h: f32) -> bool {
+    /// camera and request any missing tiles. (The render loop repaints every frame
+    /// unconditionally, so no streaming-state flag is returned — late tiles upload
+    /// on the next frame regardless.)
+    pub fn update(&mut self, view_proj: Mat4, eye: Vec3, viewport_h: f32) {
         self.frame += 1;
 
         // Basemap off: nothing to draw, nothing streaming.
@@ -412,7 +416,7 @@ impl TileGlobe {
             // Drain any late arrivals so the channel doesn't grow unbounded.
             while self.results.try_recv().is_ok() {}
             self.render_list.clear();
-            return false;
+            return;
         };
 
         // Upload any tiles that finished downloading (bounded per frame).
@@ -456,14 +460,14 @@ impl TileGlobe {
                 view_formats: &[],
             });
             self.queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 &t.rgba,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * t.w),
                     rows_per_image: Some(t.h),
@@ -579,7 +583,6 @@ impl TileGlobe {
         }
 
         self.evict();
-        !self.pending.is_empty()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,7 +648,7 @@ impl TileGlobe {
     }
 
     /// Draw the current tile set. Camera bind group (group 0) must already be set.
-    pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.patch_vbuf.slice(..));
         pass.set_index_buffer(self.patch_ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -750,15 +753,14 @@ fn worker(qs: Arc<(Mutex<VecDeque<Job>>, Condvar)>, tx: Sender<TileMsg>) {
         let fail = |tx: &Sender<TileMsg>| {
             let _ = tx.send(TileMsg::Failed { id, gen });
         };
-        let Ok(resp) = ureq::get(&url).set("User-Agent", "beam-viz/1.0").call() else {
+        let Ok(mut resp) = ureq::get(&url).header("User-Agent", "beam-viz/1.0").call() else {
             fail(&tx);
             continue;
         };
-        let mut buf = Vec::new();
-        if std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).is_err() {
+        let Ok(buf) = resp.body_mut().read_to_vec() else {
             fail(&tx);
             continue;
-        }
+        };
         match decode_rgba(&buf) {
             Some((rgba, w, h)) => {
                 let _ = tx.send(TileMsg::Loaded(Loaded { id, gen, rgba, w, h }));

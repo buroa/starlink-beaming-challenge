@@ -9,6 +9,7 @@ const msg = document.getElementById('msg');
 const worker = new Worker(new URL('./solve.worker.js', import.meta.url), { type: 'module' });
 let seq = 0;
 const pending = new Map();
+
 worker.onmessage = ({ data }) => {
   const p = pending.get(data.id);
   if (!p) return;
@@ -16,10 +17,48 @@ worker.onmessage = ({ data }) => {
   if (data.error) p.reject(new Error(data.error));
   else p.resolve(data.bytes);
 };
+
 window.solveText = (text, algo) => new Promise((resolve, reject) => {
   const id = ++seq;
   pending.set(id, { resolve, reject });
   worker.postMessage({ id, text, algo });
+});
+
+// `window.downloadText` is the import the viz wasm calls to save a solution:
+// trigger a browser download of `text` as `filename`.
+window.downloadText = (filename, text) => {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
+
+// `window.pickScenario` opens the OS file picker and resolves with the chosen
+// file's text (or '' if the user cancels) — the import the "Upload" button calls.
+window.pickScenario = () => new Promise((resolve) => {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.txt,text/plain';
+  input.style.display = 'none';
+
+  let picked = false;
+  input.addEventListener('change', async () => {
+    picked = true;
+    const file = input.files && input.files[0];
+    input.remove();
+    resolve(file ? await file.text() : '');
+  });
+
+  // Cancelling the dialog fires no 'change'; resolve '' when focus returns — but
+  // only if nothing was chosen (reading a large file can outlast this timeout, and
+  // a first-wins resolve would otherwise drop the upload silently).
+  window.addEventListener('focus', () => setTimeout(() => { if (!picked) resolve(''); }, 500), { once: true });
+  document.body.appendChild(input);
+  input.click();
 });
 
 // Feature-detect threads, load the matching viz module, and mount eframe on the

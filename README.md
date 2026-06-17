@@ -138,24 +138,27 @@ expensive way.
 
 ## WebAssembly
 
-Both the production solver **and** the GPU visualizer run in the browser, as two
-self-contained WebAssembly apps modeled on the [wasm-bindgen-rayon
+The GPU visualizer runs in the browser as a self-contained WebAssembly app, and
+it **embeds the production solver** — so the visualizer *is* the web front end:
+pick a bundled scenario or choose **"Add your own…"** and paste one in, watch it
+solve on the globe, and **download** the validator-format solution. It's modeled
+on the [wasm-bindgen-rayon
 demo](https://github.com/RReverser/wasm-bindgen-rayon/tree/main/demo).
 
 A Cargo **workspace**, two crates:
 
-- **[`beamer/`](beamer/)** — the **solver**: the `beamer` core library (parsing,
-  geometry, feasibility, bounds, assignment, trace), the native `beamer` CLI
-  ([`bin/main.rs`](beamer/bin/main.rs)), and the browser **solver app** — a
-  wasm-bindgen loader ([`src/app.rs`](beamer/src/app.rs)) exporting `solve_scenario`
-  + `initThreadPool`, with a webpack front-end.
+- **[`beamer/`](beamer/)** — the **solver core**: the library (parsing, geometry,
+  feasibility, bounds, assignment, trace) and the native `beamer` CLI
+  ([`bin/main.rs`](beamer/bin/main.rs)). No wasm bindings of its own — it's
+  consumed as a library.
 - **[`beamer-viz/`](beamer-viz/)** — **Beamer**, the visualizer: the rendering
-  library, the native `beamer-viz` desktop GUI, and the browser **visualizer app**
-  exporting `start` (mount eframe on a `<canvas>`) + `trace_scenario` +
-  `initThreadPool`. Depends on `beamer` for the core. The solver is deterministic,
-  so serial and parallel builds produce **bit-identical** solutions.
+  library, the native `beamer-viz` desktop GUI, and the browser app — a
+  wasm-bindgen loader ([`src/lib.rs`](beamer-viz/src/lib.rs)) exporting `start`
+  (mount eframe on a `<canvas>`) + `trace_scenario` + `initThreadPool`. Depends on
+  `beamer` for the core, so its coverage matches the CLI exactly. The solver is
+  deterministic, so serial and parallel builds produce **bit-identical** solutions.
 
-**Build — webpack, like the demo.** Each app is an npm project (`index.html` /
+**Build — webpack, like the demo.** The app is an npm project (`index.html` /
 `index.js` / `package.json` / `serve.json` / `webpack.config.mjs`). `npm run build`
 compiles the wasm **twice** with wasm-pack — a single-thread `pkg/` and a
 multi-thread `pkg-parallel/` — then webpack bundles `index.js`, which feature-detects
@@ -163,12 +166,11 @@ threads with [`wasm-feature-detect`](https://github.com/GoogleChromeLabs/wasm-fe
 and loads the matching one:
 
 ```sh
-cd beamer      && npm install && npm run serve   # the solver app
-cd beamer-viz  && npm install && npm run serve   # the visualizer app
+cd beamer-viz && npm install && npm run serve
 ```
 
 The threaded build needs nightly + `-Z build-std` + atomics/shared-memory flags.
-Those flags live in each app's [`.cargo/config.toml`](beamer/.cargo/config.toml)
+Those flags live in [`beamer-viz/.cargo/config.toml`](beamer-viz/.cargo/config.toml)
 (scoped to `[target.wasm32-unknown-unknown]`); the single-thread `build:wasm-st`
 script clears `RUSTFLAGS` (`cross-env RUSTFLAGS=`) to opt out and link the plain,
 non-atomics std. (cargo can't scope rustflags per cargo-feature, so config-plus-opt-out
@@ -185,17 +187,17 @@ static host there's nothing to hand-patch.
 same-origin` + `Cross-Origin-Embedder-Policy: require-corp`). Locally, `npm run serve`
 runs `serve --config serve.json`, which sets those headers. On **GitHub Pages** —
 which can't set headers — [`coi-serviceworker.js`](coi-serviceworker.js), bundled into
-each app, registers a service worker that injects them (and re-serves the cross-origin
+the app, registers a service worker that injects them (and re-serves the cross-origin
 basemap tiles as `Cross-Origin-Resource-Policy: cross-origin` so they survive).
 `std::time::Instant` panics on wasm, so the solver uses
 [`web-time`](https://crates.io/crates/web-time), an API-identical drop-in.
 
-**Threading.** The solver app calls `solve_scenario` on the **main thread** — rayon's
-Web Worker pool does the parallel work, so it doesn't block. The visualizer instead
-hands `trace_scenario` to a dedicated worker ([`beamer-viz/solve.worker.js`](beamer-viz/solve.worker.js))
-so the solve never stalls the render loop; it returns `(Scenario, Feasibility, Trace)`
+**Threading.** The visualizer hands `trace_scenario` to a dedicated worker
+([`beamer-viz/solve.worker.js`](beamer-viz/solve.worker.js)) so the solve never stalls
+the render loop; on a cross-origin-isolated page the worker brings up rayon's Web
+Worker pool and solves in parallel, then returns `(Scenario, Feasibility, Trace)`
 postcard-serialized for the render thread to rebuild. Measured in-browser on 16
-hardware threads (`solve_scenario` wall time, matching the CLI's coverage exactly):
+hardware threads (solve wall time, matching the CLI's coverage exactly):
 
 | Case | Serial | Threaded (16 workers) |
 |---|---|---|
@@ -209,10 +211,9 @@ runs faster serial — which is also the fallback when a browser isn't cross-ori
 isolated.
 
 **Deploy.** A GitHub Actions workflow ([`.github/workflows/pages.yml`](.github/workflows/pages.yml))
-`npm run build`s both apps and publishes the assembled site to **GitHub Pages** on
-every push to `main` — the visualizer at `/`, the solver at `/solver`, each app's
-`dist/` self-contained (its own `pkg`, `coi-serviceworker.js`, scenarios). One-time
-setup: repo *Settings → Pages → Source → "GitHub Actions"*.
+`npm run build`s the app and publishes it to **GitHub Pages** at `/` on every push to
+`main`, the `dist/` self-contained (its own `pkg`, `coi-serviceworker.js`, scenarios).
+One-time setup: repo *Settings → Pages → Source → "GitHub Actions"*.
 
 **The visualizer renders through WebGL2**: eframe 0.29 ships wgpu 22, whose WebGPU
 path requests a device limit (`maxInterStageShaderComponents`) current browsers
@@ -220,7 +221,8 @@ removed, so [`start`](beamer-viz/src/lib.rs) forces `Backends::GL` and the build
 enables wgpu's `webgl` feature. **Live basemap tiles** stream via per-tile async
 `fetch` on wasm (the native streamer's threads + `ureq` model, keeping the quadtree
 refinement, LRU cache, and `image` decode). The visualizer runs at **full parity in
-the browser** — render, all 12 scenarios, the parallel solve, and live tiles.
+the browser** — render, all 12 scenarios, **paste-your-own** + **download**, the
+parallel solve, and live tiles.
 
 ## Visualizer — Beamer
 
@@ -250,7 +252,9 @@ the way through the surface to the core and watch the network from the inside ou
 The black/white/glass HUD is one left-hand control column plus three fixed
 readouts; `H` hides all of it:
 
-- **Left column** — scenario and algorithm pickers, color-band toggles, scene
+- **Left column** — scenario and algorithm pickers (the scenario list ends in
+  **"Add your own…"** — paste a scenario in validator format and **Solve** it), a
+  **Download** button for the validator-format solution, color-band toggles, scene
   **Layers** (beams, full/partial satellites, uncovered terminals, and
   **interferers**), and the **Basemap** selector with its independent
   **Atmosphere halo** toggle.
@@ -287,15 +291,15 @@ to switch, or `Esc` / click empty space to exit.
 | `F11` | Toggle fullscreen |
 | `Esc` | Leave focus, then fullscreen |
 
-Two headless modes render without a window: `beamer --shot <scenario> <out.png>
-[fraction]` writes a single frame to a PNG, and `beamer --frames <scenario>
+Two headless modes render without a window: `beamer-viz --shot <scenario> <out.png>
+[fraction]` writes a single frame to a PNG, and `beamer-viz --frames <scenario>
 <dir> <n> [orbit°]` solves once and writes an `n`-frame playback sweep (with an
 optional camera orbit) as numbered PNGs. The looping demo at the top of this page
 is a full-color animated **WebP** (much smaller than a 256-color GIF), made with
 `ffmpeg` (downscale) + `img2webp` (encode):
 
 ```sh
-beamer --frames test_cases/11_one_hundred_thousand_users.txt /tmp/frames 60 16
+beamer-viz --frames test_cases/11_one_hundred_thousand_users.txt /tmp/frames 60 16
 # downscale the frames to 600px wide
 ffmpeg -i /tmp/frames/frame_%05d.png -vf "scale=600:-1:flags=lanczos" /tmp/f/frame_%05d.png
 # encode an animated WebP, holding the last (full-coverage) frame for a beat

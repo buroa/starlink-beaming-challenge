@@ -934,8 +934,8 @@ pub struct Solution {
 
 impl Solution {
     /// Build the near-optimality [`Certificate`](crate::io::Certificate) header
-    /// for this solution against its scenario + feasibility graph. Shared by the
-    /// CLI and the wasm `solve_scenario` entry point.
+    /// for this solution against its scenario + feasibility graph. Used by the CLI;
+    /// the visualizer reconstructs the same header from a [`trace`](crate::trace).
     pub fn certificate(
         &self,
         scn: &Scenario,
@@ -951,10 +951,10 @@ impl Solution {
     }
 }
 
-/// Default wall-clock ceiling for the optional repair/LNS phase, shared by the
-/// CLI and the wasm entry points. Far under the 15-minute grader limit; the
-/// greedy solution is always complete and valid before repair runs, so this only
-/// bounds how long the solver spends improving it.
+/// Default wall-clock ceiling for the optional repair/LNS phase, used by the
+/// `beamer` CLI. Far under the 15-minute grader limit; the greedy solution is
+/// always complete and valid before repair runs, so this only bounds how long
+/// the solver spends improving it.
 pub const REPAIR_BUDGET: Duration = Duration::from_secs(120);
 
 /// Solve the scenario. `intense` selects the maximum-coverage mode (the

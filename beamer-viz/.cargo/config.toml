@@ -2,8 +2,9 @@
 [build]
 target = "wasm32-unknown-unknown"
 
-# Threaded build flags (see beamer/.cargo/config.toml). The single-thread build
-# (`build:wasm-st`) clears RUSTFLAGS to opt out and link the plain std.
+# Threaded build flags: shared memory + atomics for the wasm-bindgen-rayon pool.
+# The single-thread build (`build:wasm-st`) clears RUSTFLAGS to opt out and link
+# the plain (non-atomics) std.
 [target.wasm32-unknown-unknown]
 rustflags = [
   "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",

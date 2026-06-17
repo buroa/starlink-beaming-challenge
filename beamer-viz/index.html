@@ -3,13 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>Beamer · WebAssembly</title>
+<title>Beamer</title>
 <!-- Cross-origin isolation (wasm threads) on hosts without COOP/COEP headers,
      e.g. GitHub Pages. Reloads once on first visit. Classic script (not module). -->
 <script src="coi-serviceworker.js"></script>
 <style>
-  html, body { margin: 0; height: 100%; background: #06090d; overflow: hidden; }
-  canvas { display: block; width: 100vw; height: 100vh; }
+  html, body { margin: 0; height: 100%; background: #06090d; overflow: hidden; overscroll-behavior: none; }
+  /* Route every touch gesture (one-finger drag, two-finger pinch) to the canvas
+     instead of letting the browser scroll the page or pinch-zoom the document. */
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
   #msg {
     position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
     color: #7d8893; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
@@ -20,6 +22,6 @@
 <body>
   <canvas id="canvas"></canvas>
   <div id="msg">loading beamer…</div>
-  <script src="index.js"></script>
+  <!-- The hashed entry <script> is injected here by html-webpack-plugin. -->
 </body>
 </html>
