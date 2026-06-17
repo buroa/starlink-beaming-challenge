@@ -50,6 +50,24 @@ impl std::ops::Sub for Vec3 {
 pub const COS45: f64 = std::f64::consts::FRAC_1_SQRT_2; // cos 45° = 1/√2
 pub const COS20: f64 = 0.939_692_620_785_908_4; //          cos 20°
 pub const COS10: f64 = 0.984_807_753_012_208; //            cos 10°
+/// cos²45° = ½ exactly — used by the sqrt-free [`visible_prefilter`].
+const COS45_SQ: f64 = 0.5;
+
+/// Sqrt-free conservative pre-filter for [`visible`]. `zenith = unit(user)`,
+/// `delta = sat - user` (the *un-normalized* offset). Returns `false` only when
+/// the satellite is provably outside the 45° cone (below the local horizon, or
+/// past the boundary even before the strict-margin test), so it never rejects a
+/// satellite the exact test would accept — but it skips the `unit()` (a sqrt plus
+/// three divides) for the large majority of nearby-but-not-overhead candidates.
+/// The exact [`visible`] test still runs on whatever survives.
+#[inline]
+pub fn visible_prefilter(zenith: Vec3, delta: Vec3) -> bool {
+    let zdot = zenith.dot(delta);
+    // `zdot > 0` (above horizon) and `zdot/|delta| > cos45` ⇔ `zdot² > cos45²·|delta|²`.
+    // Using COS45 (not COS45+EPS) makes the threshold looser than `visible`, so a
+    // true positive can never be dropped here.
+    zdot > 0.0 && zdot * zdot >= COS45_SQ * delta.dot(delta)
+}
 
 /// Conservative margin in cosine-space. ~1e-9 in cosine is < 1e-6 degrees near
 /// these thresholds — far below any meaningful coverage loss, far above f64

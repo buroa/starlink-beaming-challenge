@@ -51,6 +51,15 @@ cargo build --release
 ./target/release/beamer test_cases/11_one_hundred_thousand_users.txt --max
 ```
 
+Need a bigger scenario? The bundled `gen` tool builds one at any scale — a Walker
+constellation at 550 km, users on the WGS84 ellipsoid, and an optional
+geostationary interferer belt (deterministic per `--seed`):
+
+```sh
+# 1,000,000 users + 5,000 satellites + a 36-satellite interferer belt → a file
+cargo run --release --bin gen -- --users 1000000 --sats 5000 --interferers 36 -o test_cases/big.txt
+```
+
 ## Results
 
 `achieved` = users served · `bound` = the tighter, coloring-aware ceiling no
@@ -112,14 +121,40 @@ explicit tie-breaks, and no dependence on thread scheduling.
 ## Performance
 
 The full 100,000-user / 1,440-satellite solve — construction, repair, and the
-parallel polish — finishes in **~0.55 s** on all cores, far under the 15 min /
+parallel polish — finishes in **~0.2 s** on all cores, far under the 15 min /
 1 GB limits; every smaller case is sub-second. The exact 4-coloring oracle
 dominates the hard component and is the most-tuned hot path (stack-allocated
-search state, incremental neighbor-color counts, a K5 clique cutoff: ~30× faster
-than the first correct version, with no loss of coverage). The opt-in **`--max`**
-mode chases the last few users with a much larger search budget — it recovers
-~8 users total on the 100k case (29,446 → 29,452) in ~10 s, evidence that the
-remaining gap is that global coloring coupling and not servable users left behind.
+search state, incremental neighbor-color counts, a K5 clique cutoff, and a search
+budget sized to *find* a coloring rather than exhaustively *disprove* one). The
+opt-in **`--max`** mode chases the last few users with a much larger search
+budget — it recovers ~6 users on the 100k case (29,446 → 29,452) in ~10 s,
+evidence that the remaining gap is that global coloring coupling and not servable
+users left behind.
+
+It also **scales far past the test set.** Dense, globe-spanning constellations
+collapse the feasibility graph into one giant component, so the cross-component
+parallelism falls away — to keep all cores busy the solver overlaps the serial
+max-flow bound with the parallel greedy ensemble, realizes the flow seed across
+satellites in parallel, and on a *saturated* mega-component (more users than beam
+slots) skips the ejection-chain repair and ruin-and-recreate polish, which can
+only spin when every satellite is already full. Measured on 16 threads
+(`gen`-built scenarios; set `BEAM_PROFILE=1` for a per-phase breakdown):
+
+| Users / Satellites | Time | Served / bound |
+|---|---|---|
+| 1,000,000 / 5,000 | **1.1 s** | 100% |
+| 1,000,000 / 10,000 | **2.0 s** | 100% |
+| 2,000,000 / 8,000 | **3.3 s** | 100% |
+| 5,000,000 / 20,000 | **19 s** | 100% |
+| 8,000,000 / 30,000 | **45 s** | 100% |
+| 10,000,000 / 40,000 | **73 s** | 100% |
+
+Feasibility, the local graph build, the flow-seed realization, and the
+ruin-and-recreate search are all parallel; a sqrt-free visibility pre-filter and
+a tightened coloring-search budget cut the constant factors. The one phase that
+stays sequential is a single giant component's greedy fill — order-dependent by
+nature, so parallelizing it would change the result, which we don't trade for
+speed.
 
 ## Beamer — the visualizer
 

@@ -20,18 +20,37 @@ fn main() {
         exit(2);
     });
 
+    // `BEAM_PROFILE=1` prints a per-phase wall-clock breakdown to stderr (the
+    // solver's own phase timings are reported by `assign::prof`); it never alters
+    // the solution written to stdout.
+    let profile = std::env::var_os("BEAM_PROFILE").is_some();
+    let stamp = |label: &str, t: Instant| {
+        if profile {
+            eprintln!("  [profile] {label}={:.0}ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+    };
+
     let start = Instant::now();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("cannot read scenario '{path}': {e}");
         exit(1);
     });
+    stamp("read", start);
+
+    let t = Instant::now();
     let scn = io::Scenario::parse(&text).unwrap_or_else(|e| {
         eprintln!("parse error: {e}");
         exit(1);
     });
+    stamp("parse", t);
 
+    let t = Instant::now();
     let feas = feasibility::build(&scn);
+    stamp("feasibility", t);
+
+    let t = Instant::now();
     let sol = assign::solve(&scn, &feas, start + REPAIR_BUDGET, intense);
+    stamp("solve_total", t);
 
     let cert = sol.certificate(&scn, &feas);
     io::write_solution(std::io::stdout().lock(), &scn, &sol.per_sat, &cert)

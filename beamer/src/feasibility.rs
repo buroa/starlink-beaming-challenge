@@ -3,7 +3,7 @@
 //! filters depend only on the (user, sat) geometry, so this is computed once and
 //! is embarrassingly parallel over users.
 
-use crate::geom::{interferes, visible, Vec3};
+use crate::geom::{interferes, visible, visible_prefilter, Vec3};
 use crate::index::Grid;
 use crate::io::Scenario;
 use crate::par::*;
@@ -18,7 +18,7 @@ pub struct Feasibility {
 
 pub fn build(scn: &Scenario) -> Feasibility {
     let grid = Grid::build(&scn.sats, &scn.users);
-    // Precompute unit directions from each user to every interferer once.
+    // Precompute each user's local vertical (zenith = unit of its position) once.
     let zenith: Vec<Vec3> = scn.users.iter().map(|p| p.unit()).collect();
 
     let sats: Vec<Vec<u32>> = scn
@@ -31,7 +31,13 @@ pub fn build(scn: &Scenario) -> Feasibility {
             let intf: Vec<Vec3> = scn.interferers.iter().map(|ip| (*ip - up).unit()).collect();
             let mut out: Vec<u32> = Vec::new();
             grid.for_candidates(up, |si| {
-                let dir_su = (scn.sats[si as usize] - up).unit();
+                let delta = scn.sats[si as usize] - up;
+                // Sqrt-free reject for the (majority) candidates that are nearby
+                // but not overhead, before paying for the unit direction.
+                if !visible_prefilter(zu, delta) {
+                    return;
+                }
+                let dir_su = delta.unit();
                 if !visible(zu, dir_su) {
                     return;
                 }

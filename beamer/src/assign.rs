@@ -18,6 +18,61 @@ use crate::par::*;
 use arrayvec::ArrayVec;
 use web_time::{Duration, Instant};
 
+/// Lightweight phase profiler, enabled by setting `BEAM_PROFILE=1`. Each solver
+/// phase accumulates its wall-clock time into an atomic counter; [`prof::report`]
+/// prints the breakdown to stderr. The per-component phase times are *summed*
+/// across components — exact wall time in the single-giant-component regime that
+/// dominates large/dense instances (one component, phases run in series), an
+/// over-count only when many components solve concurrently (those instances are
+/// already fast). Zero overhead unless enabled.
+pub(crate) mod prof {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use web_time::Instant;
+
+    pub static LOCAL: AtomicU64 = AtomicU64::new(0); // per-comp local-graph setup + orders
+    pub static MATCH: AtomicU64 = AtomicU64::new(0); // Dinic matching upper bound
+    pub static CONSTRUCT: AtomicU64 = AtomicU64::new(0); // greedy ensemble + flow seed
+    pub static REPAIR: AtomicU64 = AtomicU64::new(0); // ensemble repair (subset of construct)
+    pub static LNS: AtomicU64 = AtomicU64::new(0); // ruin-and-recreate polish
+    pub static BOUND: AtomicU64 = AtomicU64::new(0); // coloring-aware upper bound
+    pub static COMPS: AtomicUsize = AtomicUsize::new(0); // component count
+    pub static MAX_USERS: AtomicUsize = AtomicUsize::new(0); // largest component's user count
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BEAM_PROFILE").is_some())
+    }
+    /// Add `start.elapsed()` to a phase counter (only when profiling is on).
+    #[inline]
+    pub fn add(c: &AtomicU64, start: Instant) {
+        c.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+    }
+    #[inline]
+    pub fn max(c: &AtomicUsize, v: usize) {
+        c.fetch_max(v, Relaxed);
+    }
+    pub fn report(decompose: web_time::Duration) {
+        let ms = |c: &AtomicU64| c.load(Relaxed) as f64 / 1e6;
+        eprintln!(
+            "  [profile] decompose={:.0}ms  local={:.0}ms  matching={:.0}ms  \
+             construct={:.0}ms (repair={:.0}ms)  lns={:.0}ms  colored_bound={:.0}ms",
+            decompose.as_secs_f64() * 1e3,
+            ms(&LOCAL),
+            ms(&MATCH),
+            ms(&CONSTRUCT),
+            ms(&REPAIR),
+            ms(&LNS),
+            ms(&BOUND),
+        );
+        eprintln!(
+            "  [profile] components={}  largest_component_users={}  (phase times summed over components)",
+            COMPS.load(Relaxed),
+            MAX_USERS.load(Relaxed),
+        );
+    }
+}
+
 /// Maximum displacement hops in an augmenting search.
 const MAX_DEPTH: u32 = 4;
 /// Per-attempt expansion budget — caps the work spent seating one user, keeping
@@ -49,6 +104,18 @@ const LNS_ATTEMPT_BUDGET_INTENSE: u32 = 2_000;
 /// certification pass (proves the optimum, lifting that component to a perfect
 /// A/bound). Larger components are out of reach for exact solving.
 const EXACT_MAX_USERS: usize = 1600;
+/// Above this many users *and* under the saturation ratio below, a component is
+/// so oversubscribed that every satellite fills regardless of coloring, so the
+/// exact-coloring "squeeze" during greedy construction is coverage-neutral but
+/// expensive — greedy then stays on the O(members) fast color path. Below this
+/// size (every realistic test component, the largest being ~18.6k users) the
+/// exact squeeze is cheap and can be coverage-decisive, so it is always used.
+const GREEDY_FAST_MIN_USERS: usize = 100_000;
+/// Greedy-ensemble width for a single-component scenario (vs. the four tuned arms
+/// used when components already fill the cores). Sized for a typical many-core
+/// host; the extra arms are diversified constructions and the best is kept, so a
+/// wider ensemble can only raise the score.
+const ENSEMBLE_WIDE: usize = 16;
 /// Node ceiling for the exact pass — past this it gives up and the heuristic
 /// result stands (so the pass can only ever help, never hurt or hang).
 const EXACT_MAX_NODES: u64 = 120_000_000;
@@ -125,6 +192,11 @@ struct CompSolver<'a> {
     g_sats: &'a [u32],
     feas: &'a [Vec<u32>], // local user -> local sat indices
     sat_deg: &'a [u32],   // local: #users that can see each sat
+    // Per-user candidate satellites pre-sorted by descending elevation (a static
+    // key), shared by all solvers; the `HighestElevation` heuristic reads this
+    // instead of recomputing the unit-direction dot products and re-sorting on
+    // every call (the dominant construction cost on dense constellations).
+    elev_order: &'a [Vec<u32>],
     sats: Vec<Sat>,
     user_sat: Vec<i32>, // local sat index, or -1
     visited: Vec<u32>,  // per-sat: generation counter for visited marking (avoids clearing)
@@ -148,6 +220,7 @@ impl<'a> CompSolver<'a> {
         c: &'a Component,
         feas: &'a [Vec<u32>],
         sat_deg: &'a [u32],
+        elev_order: &'a [Vec<u32>],
         sat_choice: SatChoice,
     ) -> Self {
         CompSolver {
@@ -156,6 +229,7 @@ impl<'a> CompSolver<'a> {
             g_sats: &c.sats,
             feas,
             sat_deg,
+            elev_order,
             sats: vec![Sat::default(); c.sats.len()],
             user_sat: vec![-1; c.users.len()],
             visited: vec![0u32; c.sats.len()],
@@ -170,19 +244,6 @@ impl<'a> CompSolver<'a> {
         }
     }
 
-    /// Greedy construction, then repair unless greedy already hit the bound.
-    /// Returns the number of users served.
-    fn solve(&mut self, order: &[u32], upper_bound: usize, deadline: Instant, recolor: bool) -> usize {
-        self.greedy(order);
-        let assigned = self.assigned_count();
-        if assigned < upper_bound {
-            self.repair(order, deadline, recolor);
-            self.assigned_count()
-        } else {
-            assigned
-        }
-    }
-
     #[inline]
     fn dir(&self, lu: u32, ls: u32) -> Vec3 {
         (self.scn.users[self.g_users[lu as usize] as usize]
@@ -190,44 +251,65 @@ impl<'a> CompSolver<'a> {
             .unit()
     }
 
-    /// Feasible sats of local user `lu`, ordered by the chosen heuristic.
-    fn ordered_candidates(&self, lu: u32) -> ArrayVec<u32, 16> {
-        let mut cs: ArrayVec<u32, 16> = self.feas[lu as usize].iter().copied().collect();
+    /// Feasible sats of local user `lu`, ordered by the chosen heuristic. With
+    /// `skip_full`, satellites already at the 32-beam cap are dropped first: a full
+    /// satellite always fails `try_insert`, so for the *greedy first-fit* path
+    /// removing them cannot change which satellite is placed, but it shrinks (or
+    /// eliminates) the sort — the dominant construction cost on dense, saturated
+    /// components, where most candidates are full late in the fill. The augment /
+    /// repair path passes `false` (it displaces members of full satellites, so it
+    /// must still see them). A user sees only a handful of satellites in a sparse
+    /// constellation, but a dense one (thousands of sats) can push past any fixed
+    /// cap, so this is an unbounded `Vec` rather than an `ArrayVec`.
+    fn candidates(&self, lu: u32, skip_full: bool) -> Vec<u32> {
+        let keep = |s: u32| !skip_full || self.sats[s as usize].load() < 32;
         match self.sat_choice {
+            // Highest elevation (most overhead) first — a static key, so the order
+            // is precomputed once per user (see `elev_order`); just filter it
+            // instead of re-deriving unit directions and re-sorting.
+            SatChoice::HighestElevation => self.elev_order[lu as usize]
+                .iter()
+                .copied()
+                .filter(|&s| keep(s))
+                .collect(),
             // Least loaded, then index — spreads load, keeps coloring slack.
             SatChoice::LeastLoaded => {
-                cs.sort_unstable_by_key(|&s| (self.sats[s as usize].load() as u32, s))
+                let mut cs: Vec<u32> =
+                    self.feas[lu as usize].iter().copied().filter(|&s| keep(s)).collect();
+                cs.sort_unstable_by_key(|&s| (self.sats[s as usize].load() as u32, s));
+                cs
             }
             // Least-contended sat first — preserve popular sats for users who
             // have no alternative.
-            SatChoice::LeastContended => cs.sort_unstable_by_key(|&s| {
-                (
-                    self.sat_deg[s as usize],
-                    self.sats[s as usize].load() as u32,
-                    s,
-                )
-            }),
-            // Highest elevation (most overhead) first. Decorate-sort: compute the
-            // user zenith once and each candidate's elevation once, instead of
-            // re-deriving both unit vectors twice per comparison (O(k) sqrts, not
-            // O(k log k)). Bit-identical keys ⇒ identical order ⇒ deterministic.
-            SatChoice::HighestElevation => {
-                let zenith =
-                    self.scn.users[self.g_users[lu as usize] as usize].unit();
-                let mut keyed: ArrayVec<(f64, u32), 16> =
-                    cs.iter().map(|&s| (zenith.dot(self.dir(lu, s)), s)).collect();
-                keyed.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                cs = keyed.iter().map(|&(_, s)| s).collect();
+            SatChoice::LeastContended => {
+                let mut cs: Vec<u32> =
+                    self.feas[lu as usize].iter().copied().filter(|&s| keep(s)).collect();
+                cs.sort_unstable_by_key(|&s| {
+                    (self.sat_deg[s as usize], self.sats[s as usize].load() as u32, s)
+                });
+                cs
             }
         }
-        cs
     }
 
-    fn greedy(&mut self, order: &[u32]) {
+    /// Candidate satellites for the augment/repair path — every feasible sat in
+    /// heuristic order (full ones included, since displacement may evict them).
+    #[inline]
+    fn ordered_candidates(&self, lu: u32) -> Vec<u32> {
+        self.candidates(lu, false)
+    }
+
+    /// First-fit greedy: seat each user on the first of its (heuristically
+    /// ordered) candidate satellites that admits a color. With `exact`, a user
+    /// may be squeezed onto a satellite by relabeling its existing beams (the
+    /// exact 4-coloring); without it, only an already-free color is used (the
+    /// cheap fast path). See [`GREEDY_FAST_MIN_USERS`].
+    fn greedy(&mut self, order: &[u32], exact: bool) {
         for &lu in order {
-            for ls in self.ordered_candidates(lu) {
+            // First-fit, so skip already-full satellites before ordering them.
+            for ls in self.candidates(lu, true) {
                 let d = self.dir(lu, ls);
-                if self.sats[ls as usize].try_insert(lu, d, true) {
+                if self.sats[ls as usize].try_insert(lu, d, exact) {
                     self.user_sat[lu as usize] = ls as i32;
                     break;
                 }
@@ -468,6 +550,7 @@ impl<'a> CompSolver<'a> {
         ub: usize,
         deadline: Instant,
         recolor: bool,
+        repair: bool,
     ) -> usize {
         // Group the matched users by their satellite.
         let mut by_sat: Vec<Vec<u32>> = vec![Vec::new(); self.sats.len()];
@@ -479,29 +562,50 @@ impl<'a> CompSolver<'a> {
         // Realize each satellite, adding users in ascending intra-satellite
         // conflict order. Colorable (spread-out) users are kept; only the
         // densely-clustered surplus that no 4-coloring can fit is evicted — i.e.
-        // we keep a near-maximum 4-colorable subset of the optimal matching.
-        for (s, users) in by_sat.iter().enumerate() {
-            let dirs: Vec<Vec3> = users.iter().map(|&u| self.dir(u, s as u32)).collect();
-            let mut deg = vec![0u32; users.len()];
-            for i in 0..users.len() {
-                for j in (i + 1)..users.len() {
-                    if same_color_conflict(dirs[i], dirs[j]) {
-                        deg[i] += 1;
-                        deg[j] += 1;
+        // we keep a near-maximum 4-colorable subset of the optimal matching. The
+        // matching maps each user to a single satellite, so the satellites are
+        // fully independent here — realize them in parallel, then merge (the merge
+        // is deterministic in satellite order, so the result is unchanged).
+        let (scn, g_users, g_sats) = (self.scn, self.g_users, self.g_sats);
+        let dir = |u: u32, s: u32| -> Vec3 {
+            (scn.users[g_users[u as usize] as usize] - scn.sats[g_sats[s as usize] as usize]).unit()
+        };
+        let realized: Vec<(Sat, Vec<u32>)> = by_sat
+            .par_iter()
+            .enumerate()
+            .map(|(s, users)| {
+                let dirs: Vec<Vec3> = users.iter().map(|&u| dir(u, s as u32)).collect();
+                let mut deg = vec![0u32; users.len()];
+                for i in 0..users.len() {
+                    for j in (i + 1)..users.len() {
+                        if same_color_conflict(dirs[i], dirs[j]) {
+                            deg[i] += 1;
+                            deg[j] += 1;
+                        }
                     }
                 }
-            }
-            let mut idx: Vec<usize> = (0..users.len()).collect();
-            idx.sort_unstable_by_key(|&i| (deg[i], users[i]));
-            for &i in &idx {
-                if self.sats[s].try_insert(users[i], dirs[i], true) {
-                    self.user_sat[users[i] as usize] = s as i32;
+                let mut idx: Vec<usize> = (0..users.len()).collect();
+                idx.sort_unstable_by_key(|&i| (deg[i], users[i]));
+                let mut sat = Sat::default();
+                let mut placed = Vec::new();
+                for &i in &idx {
+                    if sat.try_insert(users[i], dirs[i], true) {
+                        placed.push(users[i]);
+                    }
                 }
+                (sat, placed)
+            })
+            .collect();
+        for (s, (sat, placed)) in realized.into_iter().enumerate() {
+            for &u in &placed {
+                self.user_sat[u as usize] = s as i32;
             }
+            self.sats[s] = sat;
         }
-        // Repair flow-unmatched and coloring-evicted users.
+        // Repair flow-unmatched and coloring-evicted users — but only when chains
+        // can actually help (see the ensemble repair: futile on saturated giants).
         let assigned = self.assigned_count();
-        if assigned < ub {
+        if repair && assigned < ub {
             self.repair(order, deadline, recolor);
         }
         self.assigned_count()
@@ -588,7 +692,7 @@ impl<'a> CompSolver<'a> {
             // recount each round.
             freed.clear();
             freed.push(x);
-            let cands: ArrayVec<u32, 16> = self.feas[x as usize].iter().copied().collect();
+            let cands: Vec<u32> = self.feas[x as usize].to_vec();
             for &s in &cands {
                 self.touch_sat(s);
                 // Move the satellite out (leaving it reset) and drain its users —
@@ -718,19 +822,78 @@ struct CompResult {
     colored_bound: usize,
 }
 
+/// Per-satellite degree (how many component users can see each satellite) — the
+/// transpose of `local_feas`. Parallel under the `parallel` feature: each chunk
+/// builds a private histogram and they are summed element-wise. `u32` addition is
+/// associative and commutative and a count can never exceed the user count, so
+/// the result is identical regardless of how rayon chunks the work (and identical
+/// to the serial fallback) — the determinism guarantee holds.
+#[cfg(feature = "parallel")]
+fn sat_degrees(local_feas: &[Vec<u32>], ns: usize) -> Vec<u32> {
+    local_feas
+        .par_iter()
+        .fold(
+            || vec![0u32; ns],
+            |mut acc, cand| {
+                for &s in cand {
+                    acc[s as usize] += 1;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0u32; ns],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+                a
+            },
+        )
+}
+
+#[cfg(not(feature = "parallel"))]
+fn sat_degrees(local_feas: &[Vec<u32>], ns: usize) -> Vec<u32> {
+    let mut sat_deg = vec![0u32; ns];
+    for cand in local_feas {
+        for &s in cand {
+            sat_deg[s as usize] += 1;
+        }
+    }
+    sat_deg
+}
+
+/// SplitMix64 finalizer — a cheap, well-distributed hash used only to give each
+/// extra ensemble arm a different (but reproducible) tie-break order.
+#[inline]
+fn splitmix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 fn solve_component(
     scn: &Scenario,
     feas_sats: &[Vec<u32>],
     c: &Component,
     deadline: Instant,
     intense: bool,
+    single: bool,
 ) -> CompResult {
     let ns = c.sats.len();
+    if prof::on() {
+        prof::COMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prof::max(&prof::MAX_USERS, c.users.len());
+    }
+    let t = Instant::now();
     // Local feasibility: every feasible sat of a component user is in this
-    // component, so a binary search always succeeds.
+    // component, so a binary search always succeeds. One independent binary
+    // search per (user, candidate) — embarrassingly parallel over users, and the
+    // dominant setup cost on dense components (millions of users × dozens of
+    // candidates × a log-n search each).
     let local_feas: Vec<Vec<u32>> = c
         .users
-        .iter()
+        .par_iter()
         .map(|&gu| {
             feas_sats[gu as usize]
                 .iter()
@@ -739,53 +902,176 @@ fn solve_component(
         })
         .collect();
 
-    // Exact upper bound + one optimal (coloring-free) assignment for the seed.
-    let (upper_bound, matching) = matching::max_matching(&local_feas, ns);
+    let sat_deg = sat_degrees(&local_feas, ns);
 
-    let mut sat_deg = vec![0u32; ns];
-    for cand in &local_feas {
-        for &s in cand {
-            sat_deg[s as usize] += 1;
-        }
-    }
-
+    // Most-constrained-first order. The key ends in the user index, so it is a
+    // strict total order — an unstable parallel sort is therefore deterministic
+    // and byte-identical to the serial stable sort.
     let mut order: Vec<u32> = (0..c.users.len() as u32).collect();
-    order.sort_by_key(|&u| (local_feas[u as usize].len(), u));
+    order.par_sort_unstable_by_key(|&u| (local_feas[u as usize].len(), u));
 
-    // A spatial (position) user order, in addition to `order` above.
+    // A spatial (position) user order, in addition to `order` above. The index
+    // tie-break makes equal-position users a strict total order too, so the
+    // parallel unstable sort matches the serial stable sort exactly.
     let mut order_pos: Vec<u32> = (0..c.users.len() as u32).collect();
-    order_pos.sort_by(|&a, &b| {
+    order_pos.par_sort_unstable_by(|&a, &b| {
         let pa = scn.users[c.users[a as usize] as usize];
         let pb = scn.users[c.users[b as usize] as usize];
         pa.x.total_cmp(&pb.x)
             .then(pa.y.total_cmp(&pb.y))
             .then(pa.z.total_cmp(&pb.z))
+            .then(a.cmp(&b))
     });
+
+    // Per-user candidate order by descending elevation — a *static* key, so it is
+    // computed once here (in parallel over users) and shared by every solver,
+    // instead of re-deriving the unit-direction dot products and re-sorting on
+    // each `HighestElevation` call. On dense constellations (thousands of
+    // candidates per user) this re-sort was the dominant construction cost.
+    let elev_order: Vec<Vec<u32>> = (0..c.users.len())
+        .into_par_iter()
+        .map(|lu| {
+            let up = scn.users[c.users[lu] as usize];
+            let zenith = up.unit();
+            let mut keyed: Vec<(f64, u32)> = local_feas[lu]
+                .iter()
+                .map(|&s| {
+                    let sp = scn.sats[c.sats[s as usize] as usize];
+                    (zenith.dot((up - sp).unit()), s)
+                })
+                .collect();
+            keyed.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            keyed.into_iter().map(|(_, s)| s).collect()
+        })
+        .collect();
+    if prof::on() {
+        prof::add(&prof::LOCAL, t);
+    }
+
+    // A huge, heavily oversubscribed component is demand-saturated — there are
+    // more users than total beam slots, so every satellite fills to 32 regardless
+    // of how beams are colored, and the exact 4-coloring "squeeze" during greedy
+    // is coverage-neutral but expensive. Such components drop greedy to the fast
+    // color path. Every realistic component (the largest test component is ~18.6k
+    // users) stays on the exact path, so their coverage is unchanged; this only
+    // triggers on the giant single components of dense million-user
+    // constellations. `capacity = Σ min(32, deg)` bounds servable users from the
+    // satellite side and needs only `sat_deg` — so the gate is known *without* the
+    // matching, which lets the matching overlap construction below.
+    let capacity: usize = sat_deg.iter().map(|&d| d.min(32) as usize).sum();
+    let greedy_exact = !(c.users.len() > GREEDY_FAST_MIN_USERS && c.users.len() > capacity);
+
+    // Widen the ensemble only when the scenario is a single component (so cores
+    // would otherwise idle) AND the component is coloring-bound (has a residual gap
+    // that more diverse constructions can close — a saturated component reaches its
+    // bound on the first arm) AND small enough that the extra arms parallelize
+    // cleanly. The last matters because each arm clones the whole per-component
+    // solver: on a multi-hundred-k-user component, 16 of them thrash cache and run
+    // *slower* than four for a negligible coverage gain. The best arm is kept, so a
+    // wider ensemble can only raise the score; the factor is fixed, so the result
+    // is identical on any machine (serial == parallel).
+    let arms = if single && greedy_exact && c.users.len() <= GREEDY_FAST_MIN_USERS {
+        ENSEMBLE_WIDE
+    } else {
+        4
+    };
+
+    // The construction ensemble. The first four arms are the tuned heuristics,
+    // each paired with the user order it builds (and later repairs) in:
+    //   0: least-loaded sats        1: highest-elevation sats
+    //   2: least-contended sats     3: spatial user order + highest elevation
+    // A widened single-component ensemble runs `arms` of them and keeps the best —
+    // strictly ≥ the four-arm result, never worse. Beyond the six natural
+    // (heuristic × order) pairings, extra arms reuse the most-constrained-first
+    // order with a per-arm pseudo-random tie-break, diversifying the packing the
+    // LNS then polishes. The widen factor is fixed, so the result is identical on
+    // any machine and serial == parallel.
+    let perturbed: Vec<Vec<u32>> = (0..arms.saturating_sub(6))
+        .into_par_iter()
+        .map(|k| {
+            let seed = splitmix(0xA076_1D64_78BD_642F ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut o: Vec<u32> = (0..c.users.len() as u32).collect();
+            o.par_sort_unstable_by_key(|&u| {
+                (local_feas[u as usize].len() as u32, splitmix((u as u64) ^ seed) as u32)
+            });
+            o
+        })
+        .collect();
+    let natural: [(SatChoice, &Vec<u32>); 6] = [
+        (SatChoice::LeastLoaded, &order),
+        (SatChoice::HighestElevation, &order),
+        (SatChoice::LeastContended, &order),
+        (SatChoice::HighestElevation, &order_pos),
+        (SatChoice::LeastLoaded, &order_pos),
+        (SatChoice::LeastContended, &order_pos),
+    ];
+    let cyc = [SatChoice::LeastLoaded, SatChoice::HighestElevation, SatChoice::LeastContended];
+    let mut configs: Vec<(SatChoice, &Vec<u32>)> = natural.iter().copied().take(arms).collect();
+    for (k, o) in perturbed.iter().enumerate() {
+        configs.push((cyc[k % cyc.len()], o));
+    }
 
     // One full construct → flow-seed → LNS → (Maximum) recolor pipeline, for a
     // given construction `recolor` mode. Factored so Maximum mode can run it BOTH
     // ways and keep the per-component best: recolor-during-construction recovers a
     // user on some components (09/10) but costs users on others (11), and neither
     // mode wins everywhere — so the only way to the true maximum is to try both.
-    let run_pipeline = |recolor: bool| -> CompSolver {
-        // Ensemble of independent greedy constructions; keep the best. They don't
-        // interact, so they run in parallel.
-        //   0: least-loaded sats        1: highest-elevation sats
-        //   2: least-contended sats     3: spatial user order + highest elevation
-        let mut runs: Vec<(usize, CompSolver)> = (0u32..4)
+    // Returns the solver plus the (reusable) matching bound + assignment.
+    let run_pipeline = |recolor: bool, precomputed: Option<(usize, Vec<i32>)>| -> (CompSolver, usize, Vec<i32>) {
+        let t = Instant::now();
+        // Ensemble of independent greedy constructions (construction only — repair
+        // is deferred until the matching bound is known). They don't interact, so
+        // they run in parallel.
+        let build = || -> Vec<CompSolver> {
+            (0u32..configs.len() as u32)
+                .into_par_iter()
+                .map(|cfg| {
+                    let (sat_choice, ord) = configs[cfg as usize];
+                    let mut solver = CompSolver::new(scn, c, &local_feas, &sat_deg, &elev_order, sat_choice);
+                    solver.greedy(ord, greedy_exact);
+                    solver
+                })
+                .collect()
+        };
+        // The exact matching is a serial max-flow that construction does not
+        // depend on, so compute the two CONCURRENTLY: the matching core stays busy
+        // through the greedy phase and the slower of the two drops off the critical
+        // path. (Maximum mode's second pass reuses the matching from the first.)
+        let mt = Instant::now();
+        let ((upper_bound, matching), solvers) = match precomputed {
+            Some(m) => (m, build()),
+            None => join(
+                || {
+                    let r = matching::max_matching(&local_feas, ns);
+                    if prof::on() {
+                        prof::add(&prof::MATCH, mt);
+                    }
+                    r
+                },
+                build,
+            ),
+        };
+        // Repair now that the bound is known — each run short of the bound is
+        // repaired in the order it was built (parallel, since runs are
+        // independent). Skipped in fast-greedy (saturated) mode: every satellite is
+        // full there, so no displacement chain can seat another user, and repair
+        // would burn its whole budget on each of the (very many) unservable users
+        // for no gain — the flow seed already realizes the matching cardinality and
+        // the LNS polishes, so coverage holds.
+        let rt = Instant::now();
+        let mut runs: Vec<(usize, CompSolver)> = solvers
             .into_par_iter()
-            .map(|cfg| {
-                let (sat_choice, ord) = match cfg {
-                    1 => (SatChoice::HighestElevation, &order),
-                    2 => (SatChoice::LeastContended, &order),
-                    3 => (SatChoice::HighestElevation, &order_pos),
-                    _ => (SatChoice::LeastLoaded, &order),
-                };
-                let mut solver = CompSolver::new(scn, c, &local_feas, &sat_deg, sat_choice);
-                let ach = solver.solve(ord, upper_bound, deadline, recolor);
-                (ach, solver)
+            .enumerate()
+            .map(|(cfg, mut solver)| {
+                if greedy_exact && solver.assigned_count() < upper_bound {
+                    solver.repair(configs[cfg].1, deadline, recolor);
+                }
+                (solver.assigned_count(), solver)
             })
             .collect();
+        if prof::on() {
+            prof::add(&prof::REPAIR, rt);
+        }
         // Best greedy; ties resolve to the lowest member index (deterministic).
         let mut best_idx = 0;
         for i in 1..runs.len() {
@@ -798,8 +1084,8 @@ fn solve_component(
         // Flow-seeded construction (realize the optimal matching, then repair),
         // run only when greedy fell short of the bound; it wins ties.
         let (best_seed_ach, seed_solver) = if best_greedy_ach < upper_bound {
-            let mut fs = CompSolver::new(scn, c, &local_feas, &sat_deg, SatChoice::LeastLoaded);
-            let fs_ach = fs.seed_and_repair(&matching, &order, upper_bound, deadline, recolor);
+            let mut fs = CompSolver::new(scn, c, &local_feas, &sat_deg, &elev_order, SatChoice::LeastLoaded);
+            let fs_ach = fs.seed_and_repair(&matching, &order, upper_bound, deadline, recolor, greedy_exact);
             if fs_ach >= best_greedy_ach {
                 (fs_ach, fs)
             } else {
@@ -808,10 +1094,18 @@ fn solve_component(
         } else {
             runs.swap_remove(best_idx)
         };
+        if prof::on() {
+            prof::add(&prof::CONSTRUCT, t);
+        }
 
         // Polish with parallel ruin-and-recreate LNS (intensive under `intense`),
         // keeping the best worker. Components at their bound exit LNS immediately.
-        let mut best_solver = if best_seed_ach < upper_bound {
+        // Fast-greedy (huge saturated) components skip it: each of the 16 workers
+        // would clone the giant solver and ruin-recreate for essentially no gain
+        // (the flow seed already realizes the matching cardinality, and with every
+        // satellite full there is nothing to re-pack), so it is pure cost there.
+        let t = Instant::now();
+        let mut best_solver = if greedy_exact && best_seed_ach < upper_bound {
             let mut polished: Vec<CompSolver> = (0..LNS_WORKERS)
                 .into_par_iter()
                 .map(|w| {
@@ -834,25 +1128,31 @@ fn solve_component(
             seed_solver // already provably optimal for this component
         };
 
+        if prof::on() {
+            prof::add(&prof::LNS, t);
+        }
+
         // Maximum mode only: one coloring-complete pass over the residual.
         if intense && best_solver.assigned_count() < upper_bound {
             best_solver.recolor_repair(&order, deadline);
         }
-        best_solver
+        (best_solver, upper_bound, matching)
     };
 
     // Default: a single pass (no construction recolor). Maximum: run both
-    // construction modes and keep whichever serves more on this component.
-    let best_solver = if intense {
-        let plain = run_pipeline(false);
-        let recolored = run_pipeline(true);
+    // construction modes and keep whichever serves more on this component (the
+    // second pass reuses the matching computed by the first).
+    let (best_solver, upper_bound) = if intense {
+        let (plain, ub, m) = run_pipeline(false, None);
+        let (recolored, _, _) = run_pipeline(true, Some((ub, m)));
         if recolored.assigned_count() > plain.assigned_count() {
-            recolored
+            (recolored, ub)
         } else {
-            plain
+            (plain, ub)
         }
     } else {
-        run_pipeline(false)
+        let (s, ub, _) = run_pipeline(false, None);
+        (s, ub)
     };
 
     let mut best_ach = best_solver.assigned_count();
@@ -864,7 +1164,21 @@ fn solve_component(
     // so it is blind to exactly the non-clique coloring obstructions that bound
     // the hard cases (07/09/10/11) — at a large runtime cost. `coloring_bound`
     // captures those obstructions directly.
-    let mut colored_bound = coloring_bound(scn, c, &local_feas, ns, upper_bound);
+    //
+    // Shortcut: when the heuristic already reached the (looser) matching bound,
+    // the assignment is provably optimal — `achieved ≤ optimum ≤ colored_bound ≤
+    // upper_bound = achieved` forces `colored_bound = upper_bound` — so the whole
+    // per-satellite clique partition is skipped. This is the common case on dense
+    // / saturated instances, where it was the single largest cost.
+    let t = Instant::now();
+    let mut colored_bound = if best_ach >= upper_bound {
+        upper_bound
+    } else {
+        coloring_bound(scn, c, &local_feas, ns, upper_bound)
+    };
+    if prof::on() {
+        prof::add(&prof::BOUND, t);
+    }
 
     // Exact certification (opt-in via BEAM_EXACT): if a small component still
     // has a residual gap, try to prove its optimum with branch-and-bound. On
@@ -878,7 +1192,7 @@ fn solve_component(
         && c.users.len() <= EXACT_MAX_USERS
     {
         let ex_deadline = deadline.min(Instant::now() + Duration::from_secs(30));
-        let mut ex = CompSolver::new(scn, c, &local_feas, &sat_deg, SatChoice::LeastLoaded);
+        let mut ex = CompSolver::new(scn, c, &local_feas, &sat_deg, &elev_order, SatChoice::LeastLoaded);
         if let Some((opt, sats)) = ex.solve_exact(&order, best_ach, ex_deadline) {
             best_ach = opt;
             best = sats;
@@ -967,13 +1281,25 @@ pub fn solve(
     deadline: Instant,
     intense: bool,
 ) -> Solution {
+    let t_decompose = Instant::now();
     let comps = components::decompose(feas, scn.sats.len());
+    let decompose = t_decompose.elapsed();
+
+    // A single-component scenario would leave most cores idle on the one giant
+    // construction, so its ensemble is widened (see `solve_component`); a
+    // multi-component scenario already fills cores by solving components in
+    // parallel, so it keeps the tuned four arms.
+    let single = comps.len() == 1;
 
     // Each component is fully independent → solve them in parallel.
     let results: Vec<CompResult> = comps
         .par_iter()
-        .map(|c| solve_component(scn, &feas.sats, c, deadline, intense))
+        .map(|c| solve_component(scn, &feas.sats, c, deadline, intense, single))
         .collect();
+
+    if prof::on() {
+        prof::report(decompose);
+    }
 
     let mut per_sat = vec![Vec::new(); scn.sats.len()];
     let mut achieved = 0;

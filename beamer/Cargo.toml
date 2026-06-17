@@ -11,6 +11,11 @@ description = "Starlink beam-planning solver: core library + CLI."
 name = "beamer"
 path = "bin/main.rs"
 
+# Scenario generator: build test cases at any scale (`--users`, `--sats`, …).
+[[bin]]
+name = "gen"
+path = "bin/gen.rs"
+
 [features]
 default = ["parallel"]
 # Multicore solving: rayon's work-stealing pool. The single-thread build omits

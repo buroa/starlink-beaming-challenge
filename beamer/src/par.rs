@@ -16,6 +16,10 @@
 
 #[cfg(feature = "parallel")]
 pub use rayon::prelude::*;
+/// rayon's fork-join primitive (not in the prelude). Used to overlap the serial
+/// max-flow bound with the parallel greedy ensemble.
+#[cfg(feature = "parallel")]
+pub use rayon::join;
 
 #[cfg(not(feature = "parallel"))]
 pub use serial::*;
@@ -59,6 +63,35 @@ mod serial {
         type Item = &'a T;
         fn par_iter(&'a self) -> Self::Iter {
             self.iter()
+        }
+    }
+
+    /// Sequential stand-in for `rayon::join`: just runs the two closures in order.
+    #[inline]
+    pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA,
+        B: FnOnce() -> RB,
+    {
+        (a(), b())
+    }
+
+    /// Sequential stand-in for rayon's `ParallelSliceMut` sorts. The solver only
+    /// calls these with strict-total-order keys/comparators, so the unstable sort
+    /// is deterministic and matches the parallel build byte-for-byte.
+    pub trait ParallelSliceMut<T> {
+        fn par_sort_unstable_by_key<B: Ord, F: Fn(&T) -> B>(&mut self, f: F);
+        fn par_sort_unstable_by<F: Fn(&T, &T) -> std::cmp::Ordering>(&mut self, compare: F);
+    }
+
+    impl<T> ParallelSliceMut<T> for [T] {
+        #[inline]
+        fn par_sort_unstable_by_key<B: Ord, F: Fn(&T) -> B>(&mut self, f: F) {
+            self.sort_unstable_by_key(f);
+        }
+        #[inline]
+        fn par_sort_unstable_by<F: Fn(&T, &T) -> std::cmp::Ordering>(&mut self, compare: F) {
+            self.sort_unstable_by(compare);
         }
     }
 }

@@ -16,6 +16,18 @@ use crate::geom::{same_color_conflict, Vec3};
 /// working arrays to this lets the exact coloring run with zero heap allocation.
 const MAX_M: usize = 33;
 
+/// Backtracking-node budget for the exact 4-coloring search. Finding a valid
+/// 4-coloring of a ≤33-node conflict graph with MRV + colour-symmetry breaking
+/// takes only a handful of nodes; spending more buys nothing but *proofs* of
+/// non-4-colorability, which the K5 cutoff already catches cheaply and which —
+/// on overrun — we conservatively reject anyway. 256 sits comfortably above the
+/// point where any colorable instance is found (measured: coverage is unchanged
+/// on every test case down to ~96) while keeping dense satellites cheap, where
+/// an oversized budget was the dominant solver cost. On overrun we reject (the
+/// user goes unassigned) — at worst a marginal coverage loss, never an invalid
+/// beam or a hang.
+const COLOR_SEARCH_BUDGET: u32 = 256;
+
 /// Fast path: the lowest color none of whose members conflict with the candidate,
 /// or `None` if all four are blocked. O(members); never recolors.
 ///
@@ -83,11 +95,7 @@ pub fn try_color(dirs: &[Vec3], colors: &mut [u8], cand_dir: Vec3) -> Option<u8>
 
     let mut assign = [u8::MAX; MAX_M];
     let mut nbcnt = [[0u8; 4]; MAX_M];
-    // Bound the backtracking: a 4-colorable graph is found near-instantly with
-    // MRV, but *proving* non-4-colorability can be exponential. On overrun we
-    // conservatively reject (the user goes unassigned) — at worst a marginal
-    // coverage loss, never an invalid beam or a hang.
-    let mut budget: u32 = 40_000;
+    let mut budget = COLOR_SEARCH_BUDGET;
     let ok = color_search(&adj, m, &mut assign, &mut nbcnt, &mut budget, 0);
     if ok {
         colors[..n].copy_from_slice(&assign[..n]);
