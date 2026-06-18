@@ -2656,6 +2656,20 @@ fn unit_dirs(pos: &[Vec3]) -> Vec<Vec3> {
     pos.iter().map(|p| p.normalize()).collect()
 }
 
+/// Device descriptor for every wgpu device the visualizer creates. It requests
+/// the adapter's *real* limits rather than wgpu's conservative defaults — whose
+/// 256 MiB `max_buffer_size` rejects the large dynamic vertex buffers a
+/// million-beam scene needs (a single `make_dyn` buffer can exceed 512 MiB). An
+/// adapter always supports its own limits, so this is valid on native and WebGL2
+/// alike; on WebGL2 it lifts the cap only as far as the context actually allows.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("beamer device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }
+}
+
 /// Set up a headless wgpu device + queue (no surface). Shared by the single-frame
 /// `--shot` and the `--frames` sequence renderer.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2668,7 +2682,7 @@ fn init_gpu() -> Result<(wgpu::Device, wgpu::Queue), String> {
     }))
     .map_err(|e| format!("no GPU adapter: {e}"))?;
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
             .map_err(|e| format!("device: {e}"))?;
     Ok((device, queue))
 }
@@ -2862,8 +2876,16 @@ pub fn run() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Request the adapter's real limits (default eframe config caps buffers at
+    // 256 MiB, which rejects the big scenes) — override just the device descriptor
+    // on the default "create new" setup.
+    let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.device_descriptor = std::sync::Arc::new(device_descriptor);
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
             .with_inner_size([1600.0, 1000.0])
@@ -2881,9 +2903,11 @@ pub fn run() -> eframe::Result<()> {
 pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
     // Force the GL (WebGL2) backend for the widest browser support. egui-wgpu
     // 0.34 moved backend selection into `WgpuSetup`; override the instance
-    // descriptor's backends on the default "create new" setup.
+    // descriptor's backends on the default "create new" setup, and request the
+    // adapter's real limits so large scenes fit (capped by what WebGL2 allows).
     let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.instance_descriptor.backends = wgpu::Backends::GL;
+    wgpu_setup.device_descriptor = std::sync::Arc::new(device_descriptor);
     let web_options = eframe::WebOptions {
         wgpu_options: egui_wgpu::WgpuConfiguration {
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
