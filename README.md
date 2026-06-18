@@ -1,69 +1,69 @@
 # Beamer
 
-**A fast, fully parallel, deterministic solver for the [SpaceX Starlink Beam
-Planning tech test](docs/satellites-StarlinkBeamPlanningTechTest-091020-1241-938.pdf)
-— with a GPU globe to watch it work.**
+**A fast, parallel, deterministic solver for the [SpaceX Starlink beam-planning
+tech test](docs/satellites-StarlinkBeamPlanningTechTest-091020-1241-938.pdf) — and
+a GPU globe to watch it work.**
 
 <p align="center">
   <img src="docs/beamer.webp" width="600"
        alt="Beamer solving the 100,000-user scenario: beams paint onto a transparent, slowly turning globe over a live nebula">
   <br>
-  <em>The 100,000-user case (<code>11</code>) — the beam network painting itself onto a transparent globe over a living nebula. <a href="https://buroa.github.io/beamer/">▶ Try it live.</a></em>
+  <em>The 100,000-user case (<code>11</code>) painting itself onto a transparent globe over a living nebula. <a href="https://buroa.github.io/beamer/">▶ Try it live.</a></em>
 </p>
 
 Given Starlink satellites, users, and non-Starlink "interferer" satellites in
-ECEF coordinates, Beamer assigns beams (≤ 32 per satellite, one of 4 colors) to
-serve **as many users as possible** without breaking a constraint. It's a
-from-scratch Rust rewrite of a slow, single-threaded Python greedy, and it ships
-a **provable near-optimality certificate** with every solution — an upper bound,
-not a vibe.
+earth-centered coordinates, Beamer assigns beams — at most 32 per satellite, each
+one of four colors — to serve **as many users as possible**. Every solution ships
+with a **provable near-optimality certificate**: an upper bound no valid
+assignment can beat. Not a vibe — a number.
 
-The workspace is two crates: **`beamer`**, the solver (library + CLI), and
-**`beamer-viz`**, the visualizer (a native GUI and a browser app that embeds the
-solver).
+The workspace is two crates: **`beamer`**, the solver (library, CLI, and a
+scenario generator), and **`beamer-viz`**, the visualizer (a native window and a
+browser app that embeds the solver).
 
 ## The problem
 
-Every served user needs one beam from one satellite, subject to three hard
-constraints:
+Each served user gets one beam from one satellite, under three hard constraints:
 
-- **Visibility** — the satellite must be within 45° of the user's local vertical.
-- **Interference** — from the user's view, the satellite must sit ≥ 20° from every non-Starlink satellite.
-- **Coloring** — two same-color beams on one satellite must be ≥ 10° apart.
+- **Visibility** — the satellite is within 45° of the user's local vertical.
+- **Interference** — from the user's view, the satellite is ≥ 20° from every non-Starlink satellite.
+- **Coloring** — two same-color beams on one satellite are ≥ 10° apart (4 colors, ≤ 32 beams per satellite).
 
-Each satellite carries ≤ 32 beams across 4 colors. Maximize served users.
+Maximize served users. The constraints are *coupled* — placing one beam changes
+which colors its neighbors can take — so first-fit greedy alone leaves users
+stranded.
 
 ## Quickstart
 
-Needs a recent Rust toolchain (`python3` only for the official validator).
+A recent Rust toolchain is all you need (`python3` only for the reference validator).
 
 ```sh
 cargo build --release
 
-# Solve a scenario → validator-format solution (+ certificate header) on stdout.
+# Solve → validator-format beams + a `#` certificate header, on stdout.
 ./target/release/beamer test_cases/09_ten_thousand_users.txt
 
-# Check it with the official validator: it takes the scenario as an argument and
-# reads the solution from stdin (the `#` certificate header is ignored), so just pipe.
+# Score it with the official validator (it reads the solution from stdin):
 ./target/release/beamer test_cases/09_ten_thousand_users.txt | python3 evaluate.py test_cases/09_ten_thousand_users.txt
 
-# --max: trade seconds of intensive search for the last few users on the hardest case.
+# `--max`: spend seconds of deeper search for the last few users on the hard cases.
 ./target/release/beamer test_cases/11_one_hundred_thousand_users.txt --max
 ```
 
-Need a bigger scenario? The bundled `gen` tool builds one at any scale — a Walker
-constellation at 550 km, users on the WGS84 ellipsoid, and an optional
-geostationary interferer belt (deterministic per `--seed`):
+Want a bigger problem than the test set? `gen` builds one at any scale — a Walker
+constellation at 550 km, users on the WGS84 ellipsoid, an optional geostationary
+interferer belt — deterministic per `--seed`:
 
 ```sh
-# 1,000,000 users + 5,000 satellites + a 36-satellite interferer belt → a file
-cargo run --release --bin gen -- --users 1000000 --sats 5000 --interferers 36 -o test_cases/big.txt
+# 1,000,000 users · 5,000 satellites · a 36-satellite interferer belt.
+cargo run --release --bin gen -- --users 1000000 --sats 5000 --interferers 36 -o big.txt
+./target/release/beamer big.txt
 ```
 
 ## Results
 
-`achieved` = users served · `bound` = the tighter, coloring-aware ceiling no
-valid solution can beat · `A/bound` = the fraction of that ceiling reached.
+`achieved` = users served · `bound` = the coloring-aware ceiling no valid
+assignment can beat · `A/bound` = the fraction of that ceiling reached.
 
 | Case | Achieved | Bound | A/bound | Old Python |
 |---|---|---|---|---|
@@ -80,65 +80,55 @@ valid solution can beat · `A/bound` = the fraction of that ceiling reached.
 | 10_ten_thousand_users_geo_belt | **84.45%** | 84.81% | 99.6% | 83.77% |
 | 11_one_hundred_thousand_users | **29.45%** | 29.79% | 98.9% | 29.40% |
 
-We match or beat the old Python on every case and are **provably optimal**
-(achieved = bound) on 00–06 and 08 — the clique cuts *certify* case 03's `4/5` as
-exactly optimal rather than asserting it. On 07/09/10/11 the binding constraint is
-per-satellite 32-beam capacity and the residual gap is a *global* coloring
-coupling the (loose) bound can't see: exhaustive search recovers only a handful
-more users for vastly more compute, so the defaults already sit at the practical
-optimum.
+We match or beat the original single-threaded Python greedy on every case, and are
+**provably optimal** (achieved = bound) on eight of twelve. The clique cuts don't
+*assert* case 03's `4/5` — they *certify* it: five mutually-visible users on one
+satellite form a 5-clique, which needs five colors, so four is the true maximum.
+The residual gaps on 07/09/10/11 come from a *global* coloring coupling the bound
+can't see; `--max` confirms it recovers only a handful of users for far more
+compute, so the defaults already sit at the practical optimum.
 
 ## How it works
 
-At 550 km the constellation is sparse — each user sees only ~2–4 satellites — so
-the feasibility graph **splits into independent connected components** that share
-no satellites and are solved fully in parallel.
+At 550 km the constellation is sparse — a user sees only ~2–4 satellites — so the
+feasibility graph **splits into connected components** that share no satellites and
+solve fully in parallel.
 
-1. **Spatial index** — a uniform 3D grid over satellites + a fixed-radius ball
-   query gives each user's candidate satellites; exact visibility/interference
-   filters then build the feasibility graph.
-2. **Upper bounds** — two exact Dinic max-flows per component: a capacitated
-   **matching** bound (cap 32, ignoring color) and a tighter **coloring-aware**
-   bound (partition each satellite's <10° conflict graph into cliques; a
-   `k`-clique needs `k` colors, so cap the satellite at `Σ min(4, |Cᵢ|)`). This
-   proves case 03's optimum is **4**, not 5.
-3. **Ensemble construction** — four **coloring-integral** greedy variants run per
-   component (a user is admitted to a satellite only if a valid color exists, so
-   coloring is never a fragile post-step), plus a flow-seeded build when they fall
-   short. Per-satellite 4-coloring is solved *exactly*: DSATUR + bounded
-   backtracking, with color-symmetry breaking and a clique cutoff.
-4. **Bounded repair** — short augmenting displacement chains recover stragglers,
-   with atomic rollback and a strict budget so it can never blow up.
-5. **Large-neighborhood search** — many independent ruin-and-recreate searches run
-   in parallel (each tears down and rebuilds the cluster around an unserved
-   terminal), keeping the best; a transactional undo makes each round O(touched)
-   and work-stealing keeps every core on the hard component.
+1. **Feasibility** — a uniform 3-D grid over the satellites answers each user's
+   fixed-radius candidate query in O(1); exact visibility + interference filters
+   build the bipartite graph. Parallel over users, with a sqrt-free pre-filter for
+   the common rejects.
+2. **Bounds** — two exact [Dinic](https://en.wikipedia.org/wiki/Dinic%27s_algorithm)
+   max-flows per component: a capacitated **matching** ceiling (cap 32, ignoring
+   color), and a tighter **coloring-aware** one — partition each satellite's
+   <10°-conflict graph into cliques; a `k`-clique needs `k` colors, so cap it at
+   `Σ min(4, |Cᵢ|)`.
+3. **Construction** — an ensemble of **coloring-integral** greedy variants: a user
+   is admitted to a satellite only when a valid 4-coloring still exists, so coloring
+   is never a fragile after-step. That oracle is *exact* — DSATUR with bounded
+   backtracking, color-symmetry breaking, and a K5 cutoff — and runs in
+   microseconds. A flow-seeded build competes when greedy falls short.
+4. **Polish** — bounded augmenting displacement chains recover stragglers, then
+   parallel **ruin-and-recreate** search tears down and rebuilds the cluster around
+   each unserved user, keeping the best. A transactional undo makes every round
+   O(touched), never O(component).
 
-Every assignment clears the coloring oracle, so the result is **valid by
-construction** and **bit-for-bit deterministic**: no RNG, a fixed-seed search,
-explicit tie-breaks, and no dependence on thread scheduling.
+Because every placement clears the coloring oracle, the result is **valid by
+construction**. And it's **bit-for-bit deterministic** — no RNG, fixed-seed search,
+explicit tie-breaks, no thread-order dependence — so the serial and 16-thread
+builds produce identical solutions. The 100,000-user case lands in **~0.2 s** on
+all cores; every smaller case is sub-second, far inside the 15-minute / 1-GB budget.
 
-## Performance
+## At scale
 
-The full 100,000-user / 1,440-satellite solve — construction, repair, and the
-parallel polish — finishes in **~0.2 s** on all cores, far under the 15 min /
-1 GB limits; every smaller case is sub-second. The exact 4-coloring oracle
-dominates the hard component and is the most-tuned hot path (stack-allocated
-search state, incremental neighbor-color counts, a K5 clique cutoff, and a search
-budget sized to *find* a coloring rather than exhaustively *disprove* one). The
-opt-in **`--max`** mode chases the last few users with a much larger search
-budget — it recovers ~6 users on the 100k case (29,446 → 29,452) in ~10 s,
-evidence that the remaining gap is that global coloring coupling and not servable
-users left behind.
-
-It also **scales far past the test set.** Dense, globe-spanning constellations
-collapse the feasibility graph into one giant component, so the cross-component
-parallelism falls away — to keep all cores busy the solver overlaps the serial
-max-flow bound with the parallel greedy ensemble, realizes the flow seed across
-satellites in parallel, and on a *saturated* mega-component (more users than beam
-slots) skips the ejection-chain repair and ruin-and-recreate polish, which can
-only spin when every satellite is already full. Measured on 16 threads
-(`gen`-built scenarios; set `BEAM_PROFILE=1` for a per-phase breakdown):
+A dense, globe-spanning constellation links everything into one giant component, so
+the cross-component parallelism evaporates. The solver keeps the cores fed anyway:
+the serial max-flow bound overlaps the parallel greedy ensemble, the flow seed
+realizes across satellites in parallel, the ensemble widens to fill idle cores, and
+a *saturated* mega-component — more users than beam slots — skips the displacement
+repair and ruin-and-recreate, which can only spin when every satellite is already
+full. Measured on 16 threads (`gen` scenarios; set `BEAM_PROFILE=1` for a per-phase
+breakdown):
 
 | Users / Satellites | Time | Served / bound |
 |---|---|---|
@@ -149,90 +139,74 @@ only spin when every satellite is already full. Measured on 16 threads
 | 8,000,000 / 30,000 | **45 s** | 100% |
 | 10,000,000 / 40,000 | **73 s** | 100% |
 
-Feasibility, the local graph build, the flow-seed realization, and the
-ruin-and-recreate search are all parallel; a sqrt-free visibility pre-filter and
-a tightened coloring-search budget cut the constant factors. The one phase that
-stays sequential is a single giant component's greedy fill — order-dependent by
-nature, so parallelizing it would change the result, which we don't trade for
-speed.
+All optimal. The one phase that stays sequential is a single component's greedy
+fill — order-dependent by nature, so parallelizing it would change the answer,
+which we don't trade for speed.
 
-## Beamer — the visualizer
-
-A GPU-rendered, interactive 3D globe (wgpu + egui), native or in the browser.
+## The visualizer
 
 ```sh
 cargo run --release --bin beamer-viz
 ```
 
-It opens on the 100k case and plays the assignment live, driven by the **same
-production solver** — so coverage matches the CLI certificate exactly. Beams are
-RGB ribbons (A red · B green · C blue · D yellow) painting onto a **transparent
-earth** over a procedural nebula; pick a **basemap** (Dark / Light / Satellite) to
-stream a live level-of-detail globe (nothing pre-baked — zooming pulls
-higher-detail tiles on background threads), with an independent **Fresnel
-atmosphere** toggle. Scroll through the surface to the core and watch the network
-from the inside out.
+A GPU-rendered interactive globe (wgpu + egui), driven by the **same production
+solver** — so what you see matches the CLI certificate exactly. It opens on the
+100k case and paints the assignment live: beams are RGB ribbons (**A** red · **B**
+green · **C** blue · **D** yellow) on a *transparent* earth over a procedural
+nebula. Pick a **basemap** (Dark / Light / Satellite) to stream a live
+level-of-detail globe — nothing pre-baked; zooming pulls sharper tiles on
+background threads — and scroll all the way through the surface to watch the
+network from the inside out.
 
-- **Pick a scenario, or bring your own** — the scenario list ends in **"Add your
-  own…"**: upload, paste, or drag-and-drop a validator-format scenario, solve it
-  on the globe, and **download** the solution. Switch algorithms (greedy /
-  flow-seeded for comparison, or `Maximum`, the `--max` equivalent).
-- **Inspect** — color-band and scene-layer toggles (beams, full/partial
-  satellites, uncovered terminals, interferers); hover anything for a tooltip;
-  toggle **interferers** to light up each one's 20° field of interference as a
-  footprint ring on the globe beneath it.
-- **Why unserved** — a bottom-right card groups failures by cause (no satellite in
-  view / blocked by an interferer / all full / no free color) with a list you can
-  **click to fly the camera to**.
-- **Focus a satellite** — click one to drop into a cinematic study of just that
-  one: a pulsing lock-on reticle, its beam fan to the users it serves, the nearest
-  interferer's field, and a scoped **replay** scrubber. `Esc` or click away to exit.
+- **Bring your own** — the scenario list ends in *"Add your own…"*: upload, paste,
+  or drag a validator-format scenario, solve it on the globe, and **download** the
+  result. Switch algorithms (greedy / flow-seeded / `Maximum`).
+- **Inspect** — toggle color bands and scene layers (beams, full/partial
+  satellites, uncovered users, interferers); hover anything for a tooltip; light up
+  each interferer's 20° field as a footprint ring on the globe beneath it.
+- **Why unserved** — a card groups failures by cause (none in view / blocked by an
+  interferer / all full / no free color), each entry clickable to fly the camera there.
+- **Focus a satellite** — click one for a cinematic study of just that satellite: a
+  lock-on reticle, its beam fan to the users it serves, the nearest interferer's
+  field, and a scoped replay scrubber.
 
 | Input | Action |
 |---|---|
 | Drag | Orbit |
 | Scroll | Zoom (all the way to the core) |
 | Click a satellite | Focus it |
-| `H` | Hide / show the HUD |
-| `F11` | Toggle fullscreen |
-| `Esc` | Dismiss the dialog → leave focus → exit fullscreen |
+| `H` / `F11` | HUD / fullscreen |
+| `Esc` | Dismiss dialog → leave focus → exit fullscreen |
 
-## Run it in the browser
+### In the browser
 
 `beamer-viz` compiles to WebAssembly and **embeds the solver**, so the visualizer
-*is* the web front end — **[live on GitHub Pages](https://buroa.github.io/beamer/)**.
-The browser build is full parity: render, all 12 scenarios, paste-your-own +
-download, live basemap tiles, and the **parallel solve**. The solve runs in a Web
-Worker; on a [cross-origin-isolated](https://web.dev/articles/coop-coep) page it
-brings up a [`wasm-bindgen-rayon`](https://github.com/RReverser/wasm-bindgen-rayon)
-thread pool — and because the solver is deterministic, serial and threaded builds
-produce bit-identical solutions. Measured in-browser on 16 hardware threads:
-
-| Case | Serial | Threaded (16 workers) |
-|---|---|---|
-| `09` · 10k users | 2.5 s | **0.38 s** |
-| `11` · 100k users | 31.7 s | **12.0 s** |
+*is* the web front end — **[live on GitHub Pages](https://buroa.github.io/beamer/)**,
+at full parity. The solve runs in a Web Worker; on a
+[cross-origin-isolated](https://web.dev/articles/coop-coep) page it brings up a
+[`wasm-bindgen-rayon`](https://github.com/RReverser/wasm-bindgen-rayon) thread pool —
+and because the solver is deterministic, the single- and multi-threaded builds
+return identical solutions, the second just faster.
 
 ```sh
 cd beamer-viz && npm install && npm run serve
 ```
 
-`npm run build` compiles the wasm **twice** (a single-thread `pkg/` and a
-multi-thread `pkg-parallel/`); webpack bundles a loader that
+`npm run build` compiles the wasm twice (single-thread `pkg/`, multi-thread
+`pkg-parallel/`); webpack
 [feature-detects threads](https://github.com/GoogleChromeLabs/wasm-feature-detect)
-and picks the right one, and a [GitHub Actions
-workflow](.github/workflows/pages.yml) publishes `dist/` to Pages on every push to
-`main`. A few wasm realities, handled: rendering is WebGL2 (`Backends::GL`) for the
-widest browser support; [`coi-serviceworker.js`](coi-serviceworker.js) supplies the
-cross-origin-isolation headers Pages can't set; and `std::time::Instant` (which
-panics on wasm) is swapped for the drop-in [`web-time`](https://crates.io/crates/web-time).
+and loads the right one, and a [GitHub Action](.github/workflows/pages.yml) deploys
+`dist/` to Pages on every push to `main`. The wasm realities, handled: WebGL2
+(`Backends::GL`) for the widest reach, [`coi-serviceworker.js`](coi-serviceworker.js)
+for the isolation headers Pages won't set, and
+[`web-time`](https://crates.io/crates/web-time) in place of the
+`std::time::Instant` that panics in wasm.
 
-## The hero image
+## Reproducing the demo
 
-The looping demo above is a full-color animated WebP (much smaller than a
-256-color GIF). Two headless modes render without a window — `--shot <scenario>
-<out.png> [fraction]` (one frame) and `--frames <scenario> <dir> <n> [orbit°]` (a
-playback sweep with an optional camera orbit) — then `ffmpeg` + `img2webp` encode it:
+The looping hero is an animated WebP. Two headless render modes need no window —
+`--shot <scenario> <out.png> [fraction]` for one frame, `--frames <scenario> <dir>
+<n> [orbit°]` for a sweep — then `ffmpeg` + `img2webp` encode it:
 
 ```sh
 beamer-viz --frames test_cases/11_one_hundred_thousand_users.txt /tmp/frames 60 16
@@ -242,4 +216,4 @@ img2webp -loop 0 -lossy -q 84 -m 6 -d 50 /tmp/f/frame_*.png -d 1500 /tmp/f/frame
 
 ---
 
-Basemaps © OpenStreetMap contributors © CARTO; satellite imagery © Esri.
+Basemaps © OpenStreetMap contributors © CARTO · satellite imagery © Esri.
